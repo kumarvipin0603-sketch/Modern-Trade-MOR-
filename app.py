@@ -1,6 +1,11 @@
 import streamlit as st
 import pandas as pd
-import sqlite3, io, hashlib, re, time, warnings, math
+import sqlite3, io, hashlib, re, time, warnings, math, os
+from dotenv import load_dotenv
+import psycopg2
+from psycopg2 import IntegrityError as PGIntegrityError
+from psycopg2.extras import execute_values
+from sqlalchemy import create_engine
 import sys, subprocess
 from pathlib import Path
 
@@ -35,10 +40,103 @@ UPLOAD_DIR = DATA_DIR / "uploads"
 DB_PATH = DATA_DIR / "control_tower.db"
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
+load_dotenv(override=False)
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+USE_POSTGRES = DATABASE_URL.lower().startswith(("postgresql://", "postgres://"))
+
 # =========================================================
-# DATABASE
+# DATABASE — SQLite local fallback / Supabase PostgreSQL production
 # =========================================================
+def _qmark_to_pg(sql):
+    # Application SQL uses qmark placeholders and does not contain literal ? SQL operators.
+    return sql.replace("?", "%s")
+
+def _translate_pg_sql(sql):
+    s = str(sql)
+    # SQLite accepts aliases such as AS 'Ledger Name'.
+    # PostgreSQL requires an identifier alias, e.g. AS "Ledger Name".
+    # This conversion is applied only to SQL immediately before execution.
+    s = re.sub(
+        r"\bAS\s+'([^']+)'",
+        lambda m: 'AS "' + m.group(1).replace('"', '""') + '"',
+        s,
+        flags=re.I,
+    )
+    s = re.sub(r"INTEGER\s+PRIMARY\s+KEY\s+AUTOINCREMENT", "BIGSERIAL PRIMARY KEY", s, flags=re.I)
+    s = re.sub(r"\bBEGIN\s+IMMEDIATE\b", "BEGIN", s, flags=re.I)
+    if re.search(r"INSERT\s+OR\s+IGNORE\s+INTO", s, flags=re.I):
+        s = re.sub(r"INSERT\s+OR\s+IGNORE\s+INTO", "INSERT INTO", s, flags=re.I)
+        s = s.rstrip().rstrip(';') + " ON CONFLICT DO NOTHING"
+    return _qmark_to_pg(s)
+
+class PGCompatCursor:
+    def __init__(self, cursor, lastrowid=None):
+        self._cursor = cursor
+        self.lastrowid = lastrowid
+        self.rowcount = cursor.rowcount
+        self.description = cursor.description
+    def fetchone(self):
+        return self._cursor.fetchone()
+    def fetchall(self):
+        return self._cursor.fetchall()
+    def __iter__(self):
+        return iter(self._cursor)
+    def close(self):
+        try: self._cursor.close()
+        except Exception: pass
+
+class PGCompatConnection:
+    def __init__(self):
+        self._con = psycopg2.connect(DATABASE_URL, connect_timeout=20, application_name="modern_trade_control_tower")
+        self._con.autocommit = False
+    def execute(self, sql, params=()):
+        translated = _translate_pg_sql(sql)
+        # The legacy app expects cursor.lastrowid for uploads and manual GRN inserts.
+        returning_id = bool(re.match(r"\s*INSERT\s+INTO\s+(uploads|grn_lines)\b", translated, flags=re.I))
+        if returning_id and "RETURNING" not in translated.upper() and "ON CONFLICT" not in translated.upper():
+            translated = translated.rstrip().rstrip(';') + " RETURNING id"
+        cur = self._con.cursor()
+        # psycopg2 treats % characters as parameter-format tokens whenever a
+        # second execute() argument is supplied. Many dashboard queries contain
+        # SQL LIKE '%FG%' / '%text%' but no parameters. Passing an empty tuple
+        # therefore raises IndexError: tuple index out of range.
+        if params:
+            cur.execute(translated, tuple(params))
+        else:
+            cur.execute(translated)
+        lastrowid = None
+        if returning_id and cur.description:
+            row = cur.fetchone()
+            lastrowid = row[0] if row else None
+        return PGCompatCursor(cur, lastrowid)
+    def executemany(self, sql, seq):
+        cur = self._con.cursor()
+        seq = list(seq)
+        if not seq:
+            return PGCompatCursor(cur)
+        cur.executemany(_translate_pg_sql(sql), seq)
+        return PGCompatCursor(cur)
+    def commit(self): self._con.commit()
+    def rollback(self): self._con.rollback()
+    def close(self): self._con.close()
+    def cursor(self): return self._con.cursor()
+
+def db_engine():
+    if not USE_POSTGRES:
+        return None
+    # Supabase Session Pooler friendly: small pool, pre-ping and recycle.
+    return create_engine(
+        DATABASE_URL,
+        pool_pre_ping=True,
+        pool_size=5,
+        max_overflow=5,
+        pool_recycle=900,
+        connect_args={"connect_timeout": 20, "application_name": "modern_trade_control_tower"},
+    )
+
 def open_db():
+    if USE_POSTGRES:
+        return PGCompatConnection()
     con = sqlite3.connect(DB_PATH, timeout=120, check_same_thread=False)
     con.execute("PRAGMA busy_timeout=120000")
     try:
@@ -321,6 +419,11 @@ def init_db():
         # in place instead of forcing a reset.
 
         def table_exists(table_name):
+            if USE_POSTGRES:
+                return con.execute(
+                    "SELECT 1 FROM information_schema.tables WHERE table_schema='public' AND table_name=?",
+                    (table_name,)
+                ).fetchone() is not None
             return con.execute(
                 "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
                 (table_name,)
@@ -329,6 +432,11 @@ def init_db():
         def table_columns(table_name):
             if not table_exists(table_name):
                 return set()
+            if USE_POSTGRES:
+                return {row[0] for row in con.execute(
+                    "SELECT column_name FROM information_schema.columns WHERE table_schema='public' AND table_name=?",
+                    (table_name,)
+                ).fetchall()}
             return {row[1] for row in con.execute(f"PRAGMA table_info({table_name})").fetchall()}
 
         def ensure_column(table_name, column_name, column_type="TEXT"):
@@ -338,6 +446,7 @@ def init_db():
 
         # uploads: V7/V8 used "path"; current code uses "stored_path".
         ensure_column("uploads", "stored_path", "TEXT")
+        ensure_column("uploads", "file_blob", "BYTEA" if USE_POSTGRES else "BLOB")
         upload_cols = table_columns("uploads")
         if "path" in upload_cols:
             con.execute(
@@ -495,6 +604,21 @@ def init_db():
 
 init_db()
 
+# Production database status and extra PostgreSQL indexes.
+if USE_POSTGRES:
+    _pg_idx = open_db()
+    try:
+        for _sql in [
+            "CREATE INDEX IF NOT EXISTS idx_upload_hash_source ON uploads(file_hash, source_type)",
+            "CREATE INDEX IF NOT EXISTS idx_ship_ledger_pin_v63 ON ship_to_location_master(ledger_name, pin_code)",
+            "CREATE INDEX IF NOT EXISTS idx_sale_business_key_v63 ON sale_register(business_key)",
+        ]:
+            try: _pg_idx.execute(_sql)
+            except Exception: _pg_idx.rollback()
+        _pg_idx.commit()
+    finally:
+        _pg_idx.close()
+
 # V58 baseline Ship-to mappings supplied by user.
 _seed_ship_to_v58 = [
     ("BI Worldwide India Private Limited","600077","BI-CHENNAI"),
@@ -550,7 +674,12 @@ finally:
 
 _con_v49 = open_db()
 try:
-    _cols_v49 = {r[1] for r in _con_v49.execute("PRAGMA table_info(po_mapping_master)").fetchall()}
+    if USE_POSTGRES:
+        _cols_v49 = {r[0] for r in _con_v49.execute(
+            "SELECT column_name FROM information_schema.columns WHERE table_schema='public' AND table_name='po_mapping_master'"
+        ).fetchall()}
+    else:
+        _cols_v49 = {r[1] for r in _con_v49.execute("PRAGMA table_info(po_mapping_master)").fetchall()}
     if "page_no" not in _cols_v49:
         _con_v49.execute("ALTER TABLE po_mapping_master ADD COLUMN page_no INTEGER")
     if "table_no" not in _cols_v49:
@@ -612,8 +741,64 @@ except Exception:
     pass
 
 
-def read_sql(sql, params=()):
+def pg_insert_dataframe(df, table, conflict="nothing", conflict_column=None, page_size=2000):
+    """Fast PostgreSQL bulk insert/upsert without shared staging tables."""
+    if df is None or df.empty:
+        return 0
+    cols = list(df.columns)
+    records = []
+    for row in df.itertuples(index=False, name=None):
+        cleaned = []
+        for v in row:
+            try:
+                if pd.isna(v):
+                    v = None
+            except Exception:
+                pass
+            # Convert pandas/numpy scalars to plain Python values where possible.
+            if hasattr(v, "item") and not isinstance(v, (str, bytes, bytearray, memoryview)):
+                try: v = v.item()
+                except Exception: pass
+            cleaned.append(v)
+        records.append(tuple(cleaned))
 
+    col_sql = ",".join(cols)
+    if conflict == "update" and conflict_column:
+        updates = [c for c in cols if c != conflict_column]
+        conflict_sql = (
+            f" ON CONFLICT ({conflict_column}) DO UPDATE SET "
+            + ",".join(f"{c}=EXCLUDED.{c}" for c in updates)
+        )
+    else:
+        conflict_sql = " ON CONFLICT DO NOTHING"
+
+    raw = psycopg2.connect(
+        DATABASE_URL, connect_timeout=20, application_name="modern_trade_bulk"
+    )
+    try:
+        cur = raw.cursor()
+        sql = f"INSERT INTO {table} ({col_sql}) VALUES %s{conflict_sql}"
+        execute_values(cur, sql, records, page_size=page_size)
+        affected = cur.rowcount
+        raw.commit()
+        return affected
+    except Exception:
+        raw.rollback()
+        raise
+    finally:
+        raw.close()
+
+
+def read_sql(sql, params=()):
+    if USE_POSTGRES:
+        con = open_db()
+        try:
+            cur = con.execute(sql, params)
+            rows = cur.fetchall()
+            columns = [d[0] for d in (cur.description or [])]
+            return pd.DataFrame(rows, columns=columns)
+        finally:
+            con.close()
     con = open_db()
     try:
         return pd.read_sql_query(sql, con, params=params)
@@ -802,12 +987,13 @@ def save_upload(source_type, f, user):
     try:
         cur = con.execute(
             """INSERT INTO uploads(
-                source_type,file_name,stored_path,uploaded_by,uploaded_at,file_hash,status,rows_loaded
-            ) VALUES(?,?,?,?,?,?,?,?)""",
+                source_type,file_name,stored_path,uploaded_by,uploaded_at,file_hash,status,rows_loaded,file_blob
+            ) VALUES(?,?,?,?,?,?,?,?,?)""",
             (
                 source_type, f.name, str(stored), user,
                 datetime.now().isoformat(timespec="seconds"),
-                file_hash, "Processing", 0
+                file_hash, "Processing", 0,
+                psycopg2.Binary(raw) if USE_POSTGRES else raw
             )
         )
         uid = cur.lastrowid
@@ -815,6 +1001,22 @@ def save_upload(source_type, f, user):
         return raw, stored, uid, False
     finally:
         con.close()
+
+def materialize_upload_if_missing(upload_id, stored_path, file_name="source.bin"):
+    """Restore an original uploaded file from PostgreSQL BYTEA after server restart/redeploy."""
+    p = Path(text_value(stored_path)) if text_value(stored_path) else (UPLOAD_DIR / "restored" / file_name)
+    if p.exists():
+        return p
+    if not USE_POSTGRES:
+        return p
+    d = read_sql("SELECT file_blob FROM uploads WHERE id=?", (int(upload_id),))
+    if d.empty or d.iloc[0].get("file_blob") is None:
+        return p
+    raw = d.iloc[0]["file_blob"]
+    if isinstance(raw, memoryview): raw = raw.tobytes()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_bytes(bytes(raw))
+    return p
 
 def invalidate_dashboard_cache():
     try:
@@ -2853,10 +3055,10 @@ def ship_to_master_excel_bytes():
     """Downloadable master template/current master."""
     d = read_sql(
         """SELECT
-           ledger_name AS 'Ledger Name',
-           pin_code AS 'Pin Code',
-           ship_to_location_code AS 'Ship to Location Code',
-           ship_to_location_name AS 'Ship to Location Name'
+           ledger_name AS "Ledger Name",
+           pin_code AS "Pin Code",
+           ship_to_location_code AS "Ship to Location Code",
+           ship_to_location_name AS "Ship to Location Name"
            FROM ship_to_location_master
            ORDER BY ledger_name,pin_code"""
     )
@@ -3031,24 +3233,33 @@ def import_sale_register_fast(df):
     con = open_db()
     try:
         before = con.execute("SELECT COUNT(*) FROM sale_register").fetchone()[0]
-        con.execute("DROP TABLE IF EXISTS sale_stage")
-        clean.to_sql(
-            "sale_stage", con, if_exists="replace", index=False,
-            chunksize=1000
-        )
-        cols = list(clean.columns)
-        cs = ",".join(cols)
-        con.execute(
-            f"INSERT OR IGNORE INTO sale_register({cs}) SELECT {cs} FROM sale_stage"
-        )
-        con.commit()
-        after = con.execute("SELECT COUNT(*) FROM sale_register").fetchone()[0]
-        con.execute("DROP TABLE IF EXISTS sale_stage")
-        con.commit()
-        added = after - before
-        return added, local_dups + (len(clean) - added), len(clean)
     finally:
         con.close()
+
+    if USE_POSTGRES:
+        pg_insert_dataframe(clean, "sale_register", conflict="nothing", page_size=3000)
+    else:
+        con = open_db()
+        try:
+            con.execute("DROP TABLE IF EXISTS sale_stage")
+            clean.to_sql("sale_stage", con, if_exists="replace", index=False, chunksize=1000)
+            cols = list(clean.columns)
+            cs = ",".join(cols)
+            con.execute(f"INSERT OR IGNORE INTO sale_register({cs}) SELECT {cs} FROM sale_stage")
+            con.commit()
+            con.execute("DROP TABLE IF EXISTS sale_stage")
+            con.commit()
+        finally:
+            con.close()
+
+    con = open_db()
+    try:
+        after = con.execute("SELECT COUNT(*) FROM sale_register").fetchone()[0]
+    finally:
+        con.close()
+    added = after - before
+    invalidate_dashboard_cache()
+    return added, local_dups + (len(clean) - added), len(clean)
 
 
 def rebuild_consolidated_sale_register_row_preserving():
@@ -3077,7 +3288,9 @@ def rebuild_consolidated_sale_register_row_preserving():
     in_file_dups = 0
 
     for _, u in uploads.iterrows():
-        p = Path(text_value(u.get("stored_path")))
+        p = materialize_upload_if_missing(
+            int(u.get("id")), text_value(u.get("stored_path")), text_value(u.get("file_name"))
+        )
         if not p.exists():
             missing.append(text_value(u.get("file_name")))
             continue
@@ -3099,37 +3312,36 @@ def rebuild_consolidated_sale_register_row_preserving():
     combined = combined.drop_duplicates(subset=["source_key"], keep="first").reset_index(drop=True)
     cross_file_dups = before_cross_file - len(combined)
 
-    con = open_db()
-    try:
-        # Build staging FIRST. Live data is untouched if this step fails.
-        con.execute("DROP TABLE IF EXISTS sale_stage_v41")
-        combined.to_sql(
-            "sale_stage_v41",
-            con,
-            if_exists="replace",
-            index=False,
-            chunksize=5000
-        )
+    if USE_POSTGRES:
+        con = open_db()
+        try:
+            con.execute("DELETE FROM sale_register")
+            con.commit()
+        finally:
+            con.close()
+        pg_insert_dataframe(combined, "sale_register", conflict="nothing", page_size=5000)
+        loaded = int(read_sql("SELECT COUNT(*) AS n FROM sale_register").iloc[0]["n"])
+    else:
+        con = open_db()
+        try:
+            # Build staging FIRST. Live data is untouched if this step fails.
+            con.execute("DROP TABLE IF EXISTS sale_stage_v41")
+            combined.to_sql("sale_stage_v41", con, if_exists="replace", index=False, chunksize=5000)
+            cols = list(combined.columns)
+            cs = ",".join(cols)
+            con.execute("BEGIN IMMEDIATE")
+            con.execute("DELETE FROM sale_register")
+            con.execute(f"INSERT OR IGNORE INTO sale_register({cs}) SELECT {cs} FROM sale_stage_v41")
+            con.commit()
+            loaded = con.execute("SELECT COUNT(*) FROM sale_register").fetchone()[0]
+            con.execute("DROP TABLE IF EXISTS sale_stage_v41")
+            con.commit()
+        except Exception:
+            con.rollback()
+            raise
+        finally:
+            con.close()
 
-        cols = list(combined.columns)
-        cs = ",".join(cols)
-
-        con.execute("BEGIN IMMEDIATE")
-        con.execute("DELETE FROM sale_register")
-        con.execute(
-            f"INSERT OR IGNORE INTO sale_register({cs}) "
-            f"SELECT {cs} FROM sale_stage_v41"
-        )
-        con.commit()
-
-        loaded = con.execute("SELECT COUNT(*) FROM sale_register").fetchone()[0]
-        con.execute("DROP TABLE IF EXISTS sale_stage_v41")
-        con.commit()
-    except Exception:
-        con.rollback()
-        raise
-    finally:
-        con.close()
 
     ensure_sale_register_unique_index()
     create_performance_indexes()
@@ -3255,13 +3467,16 @@ def import_blocked(df):
                 f"{po}|{order}|{doc}|{sku}|{qty}".encode()
             ).hexdigest()
             try:
-                con.execute(
-                    """INSERT INTO blocked_shipments(
+                _sql_blocked = """INSERT INTO blocked_shipments(
                         source_key,order_no,order_line_no,document_no,posting_date,
                         customer_po_no,customer_po_date,customer_no,cust_name,cust_city,
                         erp_item_code,item_description,location_code,quantity,unit_price,
                         line_amount,qty_shipped_not_invoiced,quantity_invoiced,user_id,updated_at
-                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"""
+                if USE_POSTGRES:
+                    _sql_blocked += " ON CONFLICT (source_key) DO NOTHING"
+                _cur_blocked = con.execute(
+                    _sql_blocked,
                     (
                         key, order, text_value(r.get(c_line)) if c_line else "",
                         doc, date_value(r.get(c_post)) if c_post else "",
@@ -3280,8 +3495,13 @@ def import_blocked(df):
                         datetime.now().isoformat(timespec="seconds")
                     )
                 )
-                added += 1
-            except sqlite3.IntegrityError:
+                if USE_POSTGRES and _cur_blocked.rowcount == 0:
+                    duplicates += 1
+                else:
+                    added += 1
+            except (sqlite3.IntegrityError, PGIntegrityError):
+                if USE_POSTGRES:
+                    con.rollback()
                 duplicates += 1
         con.commit()
     finally:
@@ -3340,21 +3560,33 @@ def import_item_ledger(df):
 
     con = open_db()
     try:
-        con.execute("DROP TABLE IF EXISTS item_stage")
-        clean.to_sql("item_stage", con, if_exists="replace", index=False, chunksize=1000)
-        cols = list(clean.columns)
-        cs = ",".join(cols)
         before = con.execute("SELECT COUNT(*) FROM item_ledger").fetchone()[0]
-        con.execute(
-            f"INSERT OR REPLACE INTO item_ledger({cs}) SELECT {cs} FROM item_stage"
-        )
-        con.commit()
-        after = con.execute("SELECT COUNT(*) FROM item_ledger").fetchone()[0]
-        con.execute("DROP TABLE IF EXISTS item_stage")
-        con.commit()
-        return after - before, len(clean)
     finally:
         con.close()
+
+    if USE_POSTGRES:
+        pg_insert_dataframe(clean, "item_ledger", conflict="update", conflict_column="source_key", page_size=3000)
+    else:
+        con = open_db()
+        try:
+            con.execute("DROP TABLE IF EXISTS item_stage")
+            clean.to_sql("item_stage", con, if_exists="replace", index=False, chunksize=1000)
+            cols = list(clean.columns)
+            cs = ",".join(cols)
+            con.execute(f"INSERT OR REPLACE INTO item_ledger({cs}) SELECT {cs} FROM item_stage")
+            con.commit()
+            con.execute("DROP TABLE IF EXISTS item_stage")
+            con.commit()
+        finally:
+            con.close()
+
+    con = open_db()
+    try:
+        after = con.execute("SELECT COUNT(*) FROM item_ledger").fetchone()[0]
+    finally:
+        con.close()
+    invalidate_dashboard_cache()
+    return after - before, len(clean)
 
 
 # =========================================================
@@ -3598,14 +3830,17 @@ def _grn_insert_row(con, values, source_type):
     ).hexdigest()
 
     try:
-        con.execute(
-            """INSERT INTO grn_lines(
+        _sql_grn = """INSERT INTO grn_lines(
                 source_key,po_no,ledger_name,invoice_no,invoice_date,
                 erp_item_code,item_description,invoice_qty,transporter,docket_no,
                 grn_no,grn_date,grn_qty,delivery_cancel_date,delivery_remarks,
                 short_delivered,mir_no,sumit_invoice_upload,pod_remarks,status,
                 source_type,updated_at
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"""
+        if USE_POSTGRES:
+            _sql_grn += " ON CONFLICT (source_key) DO NOTHING"
+        _cur_grn = con.execute(
+            _sql_grn,
             (
                 key,
                 po,
@@ -3631,8 +3866,10 @@ def _grn_insert_row(con, values, source_type):
                 datetime.now().isoformat(timespec="seconds"),
             )
         )
-        return True
-    except sqlite3.IntegrityError:
+        return not (USE_POSTGRES and _cur_grn.rowcount == 0)
+    except (sqlite3.IntegrityError, PGIntegrityError):
+        if USE_POSTGRES:
+            con.rollback()
         return False
 
 
@@ -3969,14 +4206,14 @@ def import_grn_excel(df):
             qty = number_value(r.get(c_grn_qty)) if c_grn_qty else 0
             key = hashlib.sha1(f"{po}|{inv}|{grn}|{sku}|{qty}".encode()).hexdigest()
             try:
-                con.execute(
+                _cur_grn_excel = con.execute(
                     """INSERT INTO grn_lines(
                         source_key,po_no,ledger_name,invoice_no,invoice_date,
                         erp_item_code,item_description,invoice_qty,transporter,docket_no,
                         grn_no,grn_date,grn_qty,delivery_cancel_date,delivery_remarks,
                         short_delivered,mir_no,sumit_invoice_upload,pod_remarks,status,
                         source_type,updated_at
-                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""" + (" ON CONFLICT (source_key) DO NOTHING" if USE_POSTGRES else ""),
                     (
                         key, po,
                         text_value(r.get(c_ledger)) if c_ledger else "",
@@ -3992,8 +4229,13 @@ def import_grn_excel(df):
                         "Excel", datetime.now().isoformat(timespec="seconds")
                     )
                 )
-                added += 1
-            except sqlite3.IntegrityError:
+                if USE_POSTGRES and _cur_grn_excel.rowcount == 0:
+                    duplicates += 1
+                else:
+                    added += 1
+            except (sqlite3.IntegrityError, PGIntegrityError):
+                if USE_POSTGRES:
+                    con.rollback()
                 duplicates += 1
         con.commit()
     finally:
@@ -4770,7 +5012,17 @@ def latest_sale_register_upload_path():
         return None, None
     if d.empty:
         return None, None
-    return d.iloc[0]["stored_path"], d.iloc[0]["file_name"]
+    row = d.iloc[0]
+    # Query id too in PostgreSQL-enabled builds when available.
+    try:
+        src = read_sql("SELECT id,stored_path,file_name FROM uploads WHERE source_type='ERP Sale Register' ORDER BY id DESC LIMIT 1")
+        if not src.empty:
+            rr = src.iloc[0]
+            p = materialize_upload_if_missing(int(rr["id"]), rr["stored_path"], rr["file_name"])
+            return str(p), rr["file_name"]
+    except Exception:
+        pass
+    return row["stored_path"], row["file_name"]
 
 def rebuild_sale_register_from_file(path):
     p = Path(path)
@@ -4780,26 +5032,28 @@ def rebuild_sale_register_from_file(path):
     df = read_excel(raw)
     clean, local_dups = prepare_sale_register(df)
 
+    if USE_POSTGRES:
+        con = open_db()
+        try:
+            con.execute("DELETE FROM sale_register")
+            con.commit()
+        finally:
+            con.close()
+        pg_insert_dataframe(clean, "sale_register", conflict="nothing", page_size=5000)
+        inserted = int(read_sql("SELECT COUNT(*) AS n FROM sale_register").iloc[0]["n"])
+        invalidate_dashboard_cache()
+        return len(df), inserted, local_dups
+
     con = open_db()
     try:
-        # Build staging first. Do not delete the live consolidated table until
-        # the replacement dataset has been fully prepared.
         con.execute("DROP TABLE IF EXISTS sale_stage")
-        clean.to_sql(
-            "sale_stage",
-            con,
-            if_exists="replace",
-            index=False,
-            chunksize=1000
-        )
+        clean.to_sql("sale_stage", con, if_exists="replace", index=False, chunksize=1000)
         cols = list(clean.columns)
         cs = ",".join(cols)
-
         con.execute("BEGIN")
         con.execute("DELETE FROM sale_register")
         con.execute(f"INSERT OR IGNORE INTO sale_register({cs}) SELECT {cs} FROM sale_stage")
         con.commit()
-
         inserted = con.execute("SELECT COUNT(*) FROM sale_register").fetchone()[0]
         con.execute("DROP TABLE IF EXISTS sale_stage")
         con.commit()
@@ -4867,7 +5121,12 @@ def save_grn_working_changes(working_df, changed_by, reason="Main reconciliation
     con = open_db()
     saved = audited = 0
     try:
-        columns = [d[1] for d in con.execute("PRAGMA table_info(grn_lines)").fetchall()]
+        if USE_POSTGRES:
+            columns = [d[0] for d in con.execute(
+                "SELECT column_name FROM information_schema.columns WHERE table_schema='public' AND table_name='grn_lines' ORDER BY ordinal_position"
+            ).fetchall()]
+        else:
+            columns = [d[1] for d in con.execute("PRAGMA table_info(grn_lines)").fetchall()]
         for _, row in working_df.iterrows():
             po_no = _clean_excel_value(row.get("Po Number"))
             invoice_no = _clean_excel_value(row.get("Invoice No"))
@@ -4947,7 +5206,7 @@ def save_grn_working_changes(working_df, changed_by, reason="Main reconciliation
                        grn_no,grn_date,grn_qty,delivery_cancel_date,delivery_remarks,
                        short_delivered,mir_no,sumit_invoice_upload,pod_remarks,status,
                        source_type,updated_at
-                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""" + (" ON CONFLICT (source_key) DO NOTHING" if USE_POSTGRES else ""),
                     (
                         source_key, po_no,
                         _clean_excel_value(row.get("Ledger Name")),
@@ -5698,40 +5957,38 @@ def recover_sale_register_from_stored_upload(path):
     source_df = read_excel(raw)
     clean, local_dups = prepare_sale_register(source_df)
 
+    if USE_POSTGRES:
+        con = open_db()
+        try:
+            con.execute("DELETE FROM sale_register")
+            con.commit()
+        finally:
+            con.close()
+        pg_insert_dataframe(clean, "sale_register", conflict="nothing", page_size=5000)
+        recovered = int(read_sql("SELECT COUNT(*) AS n FROM sale_register").iloc[0]["n"])
+        invalidate_dashboard_cache()
+        return len(source_df), recovered, local_dups
+
     con = open_db()
     try:
         con.execute("DROP TABLE IF EXISTS sale_recovery_stage")
-        clean.to_sql(
-            "sale_recovery_stage",
-            con,
-            if_exists="replace",
-            index=False,
-            chunksize=1000
-        )
+        clean.to_sql("sale_recovery_stage", con, if_exists="replace", index=False, chunksize=1000)
         cols = list(clean.columns)
         cs = ",".join(cols)
-
         con.execute("BEGIN")
         con.execute("DELETE FROM sale_register")
-        con.execute(
-            f"INSERT OR IGNORE INTO sale_register({cs}) "
-            f"SELECT {cs} FROM sale_recovery_stage"
-        )
+        con.execute(f"INSERT OR IGNORE INTO sale_register({cs}) SELECT {cs} FROM sale_recovery_stage")
         con.commit()
-
-        recovered = con.execute(
-            "SELECT COUNT(*) FROM sale_register"
-        ).fetchone()[0]
-
+        recovered = con.execute("SELECT COUNT(*) FROM sale_register").fetchone()[0]
         con.execute("DROP TABLE IF EXISTS sale_recovery_stage")
         con.commit()
-
         return len(source_df), recovered, local_dups
     except Exception:
         con.rollback()
         raise
     finally:
         con.close()
+
 
 def render_sale_recovery_box():
     state = sale_register_recovery_status()
@@ -5873,7 +6130,9 @@ def repair_all_sale_register_ledgers_from_physical_bm():
         con.commit()
 
         for _, u in uploads.iterrows():
-            path = Path(text_value(u.get("stored_path")))
+            path = materialize_upload_if_missing(
+                int(u.get("id")), text_value(u.get("stored_path")), text_value(u.get("file_name"))
+            )
             if not path.exists():
                 missing_files += 1
                 continue
@@ -6716,6 +6975,7 @@ def b2b_order_staging_excel_bytes(df):
 # UI
 # =========================================================
 with st.sidebar:
+    st.caption("Database: Supabase PostgreSQL" if USE_POSTGRES else "Database: Local SQLite")
     st.markdown("## Control Tower")
     page = st.radio(
         "Navigation",
@@ -6760,10 +7020,10 @@ search_po = search_col.text_input(
     "Track Any PO Number",
     placeholder="Enter one PO or multiple POs separated by comma, e.g. PO001, PO002, PO003"
 )
-if button_col.button("Search PO", type="primary", use_container_width=True):
+if button_col.button("Search PO", type="primary", width="stretch"):
     st.session_state["track_po"] = search_po.strip()
     st.rerun()
-if all_col.button("Show All", use_container_width=True):
+if all_col.button("Show All", width="stretch"):
     st.session_state["track_po"] = ""
     st.rerun()
 
@@ -6933,7 +7193,7 @@ if page == "Main Reconciliation Dashboard":
         if st.button(
             "Only Pending Qty",
             type="primary" if not st.session_state["main_pending_only"] else "secondary",
-            use_container_width=True,
+            width="stretch",
             key="main_pending_button"
         ):
             st.session_state["main_pending_only"] = True
@@ -6943,7 +7203,7 @@ if page == "Main Reconciliation Dashboard":
         st.caption("Reset")
         if st.button(
             "Show All Rows",
-            use_container_width=True,
+            width="stretch",
             key="main_show_all_rows_button"
         ):
             st.session_state["main_pending_only"] = False
@@ -7128,7 +7388,7 @@ if page == "Main Reconciliation Dashboard":
         editor_key = f"main_grn_editor_{('_'.join(selected_pos) if selected_pos else 'ALL')}_{page_no}_{page_size}"
         edited_data = st.data_editor(
             page_data,
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
             height=editor_height,
             disabled=disabled_cols if authorized_grn else list(data.columns),
@@ -7143,7 +7403,7 @@ if page == "Main Reconciliation Dashboard":
 
         with action1:
             if authorized_grn:
-                if st.button("Save GRN Changes", type="primary", use_container_width=True):
+                if st.button("Save GRN Changes", type="primary", width="stretch"):
                     saved, audited = save_grn_working_changes(
                         edited_data,
                         user,
@@ -7155,7 +7415,7 @@ if page == "Main Reconciliation Dashboard":
                 st.button(
                     "Save GRN Changes",
                     disabled=True,
-                    use_container_width=True,
+                    width="stretch",
                     help="Select GRN / Returns, Logistics or Admin role to edit GRN fields."
                 )
 
@@ -7165,7 +7425,7 @@ if page == "Main Reconciliation Dashboard":
                 grn_working_excel_bytes(data),
                 f"{('_'.join(selected_pos) if selected_pos else 'ALL')}_GRN_Working_Sheet.xlsx",
                 "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True
+                width="stretch"
             )
 
         with action3:
@@ -7174,7 +7434,7 @@ if page == "Main Reconciliation Dashboard":
                 data.to_csv(index=False).encode("utf-8-sig"),
                 f"Main_Reconciliation_Dashboard_FY_{'ALL' if selected_financial_year == 'All' else selected_financial_year}.csv",
                 "text/csv",
-                use_container_width=True
+                width="stretch"
             )
 
         st.markdown("#### Upload Completed GRN Working Sheet")
@@ -7221,7 +7481,7 @@ if page == "Main Reconciliation Dashboard":
             if blocked.empty:
                 st.info("No blocked shipment record found against the selected PO(s).")
             else:
-                st.dataframe(blocked, use_container_width=True, hide_index=True)
+                st.dataframe(blocked, width="stretch", hide_index=True)
 
 # ---------------------------------------------------------
 # B2B ORDER STAGING
@@ -7278,7 +7538,7 @@ elif page == "B2B Order Staging":
 
         st.dataframe(
             show,
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
             height=min(650, 70 + min(len(show), 18)*34)
         )
@@ -7288,7 +7548,7 @@ elif page == "B2B Order Staging":
             b2b_order_staging_excel_bytes(staging),
             f"B2B_Dealer_Order_Staging_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
             "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True
+            width="stretch"
         )
 
 # ---------------------------------------------------------
@@ -7338,7 +7598,7 @@ elif page == "Factory Stock Requirement":
             shortage_num.fillna(0) > 0
         ] if only_short else req
 
-        st.dataframe(view, use_container_width=True, hide_index=True, height=560)
+        st.dataframe(view, width="stretch", hide_index=True, height=560)
 
         chart = view.head(25).set_index("ERP Item Code")[
             ["Overall Pending Qty","FG Stock","Stock Shortage / Factory Requirement"]
@@ -7523,7 +7783,7 @@ elif page == "Sales & Return 360°":
             bysku = v_inv.groupby("erp_item_code",dropna=False)["qty"].sum().reset_index(name="Sale Qty")
             stk = stock_by_sku().rename(columns={"erp_item_code":"erp_item_code","fg_stock":"FG Stock"})
             compare = bysku.merge(stk,on="erp_item_code",how="left").fillna(0).sort_values("Sale Qty",ascending=False).head(30)
-            st.dataframe(compare,use_container_width=True,hide_index=True)
+            st.dataframe(compare,width="stretch",hide_index=True)
             if not compare.empty:
                 st.bar_chart(compare.set_index("erp_item_code")[["Sale Qty","FG Stock"]])
 
@@ -7532,7 +7792,7 @@ elif page == "Sales & Return 360°":
                 Sale_Qty=("qty","sum"),
                 Sale_Value=("gross_amount","sum")
             ).reset_index().sort_values("Sale_Value",ascending=False)
-            st.dataframe(compare,use_container_width=True,hide_index=True)
+            st.dataframe(compare,width="stretch",hide_index=True)
             if not compare.empty:
                 st.bar_chart(compare.set_index("branch_code")[["Sale_Qty"]])
 
@@ -7541,7 +7801,7 @@ elif page == "Sales & Return 360°":
                 Sale_Qty=("qty","sum"),
                 Sale_Value=("gross_amount","sum")
             ).reset_index().sort_values("Sale_Value",ascending=False).head(30)
-            st.dataframe(compare,use_container_width=True,hide_index=True)
+            st.dataframe(compare,width="stretch",hide_index=True)
             if not compare.empty:
                 st.bar_chart(compare.set_index("ledger_name")[["Sale_Value"]])
 
@@ -7555,7 +7815,7 @@ elif page == "Sales & Return 360°":
 
         display_limit = st.selectbox("Rows to display", [500,1000,2500,5000], index=1)
         st.caption(f"Displaying first {min(display_limit,len(view)):,} of {len(view):,} filtered rows. Download contains all filtered rows.")
-        st.dataframe(view.head(display_limit), use_container_width=True, hide_index=True, height=480)
+        st.dataframe(view.head(display_limit), width="stretch", hide_index=True, height=480)
         st.download_button(
             "Download Sales & Return Detail",
             view.to_csv(index=False).encode("utf-8-sig"),
@@ -7591,7 +7851,7 @@ elif page == "Customer SKU & Price Master":
            FROM sku_master
            ORDER BY ledger_name,customer_item_code"""
     )
-    st.dataframe(master, use_container_width=True, hide_index=True, height=520)
+    st.dataframe(master, width="stretch", hide_index=True, height=520)
 
     if not master.empty:
         out = io.BytesIO()
@@ -7675,7 +7935,7 @@ elif page == "Upload Centre":
                 ship_to_master_excel_bytes(),
                 "Ship_To_Location_Code_Master.xlsx",
                 "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True
+                width="stretch"
             )
 
         current_ship_master = read_sql(
@@ -7689,7 +7949,7 @@ elif page == "Upload Centre":
         if not current_ship_master.empty:
             st.dataframe(
                 current_ship_master,
-                use_container_width=True,
+                width="stretch",
                 hide_index=True,
                 height=min(420, 38 + len(current_ship_master)*35)
             )
@@ -7937,7 +8197,7 @@ elif page == "Upload Centre":
                 po_mapping_template_bytes(),
                 "PO_Details_Mapping_Master_Template.xlsx",
                 "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True
+                width="stretch"
             )
 
         current_mapping = read_sql(
@@ -7960,7 +8220,7 @@ elif page == "Upload Centre":
         if not current_mapping.empty:
             st.dataframe(
                 current_mapping,
-                use_container_width=True,
+                width="stretch",
                 hide_index=True,
                 height=min(420, 40 + len(current_mapping)*32)
             )
@@ -8116,7 +8376,7 @@ elif page == "Upload Centre":
                         )
                         st.dataframe(
                             result["rows"],
-                            use_container_width=True,
+                            width="stretch",
                             hide_index=True
                         )
                     else:
@@ -8142,7 +8402,7 @@ elif page == "Upload Centre":
                             )
                             st.dataframe(
                                 result["rows"],
-                                use_container_width=True,
+                                width="stretch",
                                 hide_index=True
                             )
 
@@ -8165,7 +8425,7 @@ elif page == "Upload Centre":
                             )
                             st.dataframe(
                                 result["rows"],
-                                use_container_width=True,
+                                width="stretch",
                                 hide_index=True
                             )
                         else:
@@ -8219,7 +8479,7 @@ elif page == "Upload Centre":
                 grn_mapping_template_bytes(),
                 "GRN_Details_Mapping_Master_Template.xlsx",
                 "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True
+                width="stretch"
             )
 
         current_grn_mapping = read_sql(
@@ -8240,7 +8500,7 @@ elif page == "Upload Centre":
         if not current_grn_mapping.empty:
             st.dataframe(
                 current_grn_mapping,
-                use_container_width=True,
+                width="stretch",
                 hide_index=True,
                 height=min(420, 40 + len(current_grn_mapping)*32)
             )
@@ -8308,7 +8568,7 @@ elif page == "Upload Centre":
                                 f"{f.name}: GRN Profile '{result['profile']}' — "
                                 f"{result['added']} row(s) added, {result['duplicates']} duplicate(s) ignored."
                             )
-                            st.dataframe(result["rows"],use_container_width=True,hide_index=True)
+                            st.dataframe(result["rows"],width="stretch",hide_index=True)
                     else:
                         result = parse_grn_excel_by_mapping(raw)
                         if result is not None:
@@ -8321,7 +8581,7 @@ elif page == "Upload Centre":
                                 f"{f.name}: GRN Profile '{result['profile']}' — "
                                 f"{result['added']} row(s) added, {result['duplicates']} duplicate(s) ignored."
                             )
-                            st.dataframe(result["rows"],use_container_width=True,hide_index=True)
+                            st.dataframe(result["rows"],width="stretch",hide_index=True)
                         else:
                             df = read_excel(raw)
                             added,duplicates = import_grn_excel(df)
@@ -8343,7 +8603,7 @@ elif page == "Upload Centre":
         """SELECT id,source_type,file_name,uploaded_by,uploaded_at,status,rows_loaded
            FROM uploads ORDER BY id DESC"""
     )
-    st.dataframe(history, use_container_width=True, hide_index=True, height=360)
+    st.dataframe(history, width="stretch", hide_index=True, height=360)
 
 # ---------------------------------------------------------
 # AUDIT / EXCEPTIONS
@@ -8360,7 +8620,7 @@ elif page == "Audit / Exceptions":
         ["Customer PO Lines", safe_table_count("po_lines")],
         ["GRN Lines", safe_table_count("grn_lines")],
     ], columns=["Source","Database Rows"])
-    st.dataframe(health, use_container_width=True, hide_index=True)
+    st.dataframe(health, width="stretch", hide_index=True)
 
     tab1,tab2,tab3 = st.tabs([
         "Upload History",
@@ -8370,11 +8630,11 @@ elif page == "Audit / Exceptions":
 
     with tab1:
         history = read_sql("SELECT * FROM uploads ORDER BY id DESC")
-        st.dataframe(history,use_container_width=True,hide_index=True,height=500)
+        st.dataframe(history,width="stretch",hide_index=True,height=500)
 
     with tab2:
         audit = read_sql("SELECT * FROM grn_manual_audit ORDER BY id DESC")
-        st.dataframe(audit,use_container_width=True,hide_index=True,height=500)
+        st.dataframe(audit,width="stretch",hide_index=True,height=500)
 
     with tab3:
         main = full_main_dashboard()
@@ -8392,7 +8652,7 @@ elif page == "Audit / Exceptions":
                         "GRN Qty","Reconciliation Remarks"
                     ]
                 ],
-                use_container_width=True,
+                width="stretch",
                 hide_index=True,
                 height=500
             )
