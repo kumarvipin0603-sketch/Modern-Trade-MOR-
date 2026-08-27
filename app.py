@@ -5,8 +5,6 @@ from dotenv import load_dotenv
 import psycopg2
 from psycopg2 import IntegrityError as PGIntegrityError
 from psycopg2.extras import execute_values
-from psycopg2.pool import ThreadedConnectionPool
-from psycopg2 import extensions as pg_extensions
 from sqlalchemy import create_engine
 import sys, subprocess, gc
 from pathlib import Path
@@ -87,31 +85,30 @@ class PGCompatCursor:
         try: self._cursor.close()
         except Exception: pass
 
-@st.cache_resource(show_spinner=False)
-def pg_connection_pool():
-    """
-    Reusable local client pool for the remote Supabase Session Pooler.
-    Removes repeated TCP/authentication setup on every read_sql/open_db call.
-    """
-    if not USE_POSTGRES:
-        return None
-    return ThreadedConnectionPool(
-        minconn=1,
-        maxconn=2,
-        dsn=DATABASE_URL,
-        connect_timeout=20,
-        application_name="modern_trade_control_tower_v634",
-        keepalives=1,
-        keepalives_idle=30,
-        keepalives_interval=10,
-        keepalives_count=3,
-    )
-
-
 class PGCompatConnection:
+    """
+    Legacy DB compatibility wrapper using one short-lived psycopg2 connection.
+
+    V63.4 used a small client-side ThreadedConnectionPool. Streamlit Cloud can
+    execute overlapping reruns/sessions, and legacy code has many open_db()
+    call paths. A small local pool can therefore become exhausted even though
+    Supabase itself is healthy.
+
+    Supabase Session Pooler is already the upstream connection pool, so this
+    build deliberately removes the second client-side pool. Each legacy
+    open_db() gets a short-lived connection and close() really closes it.
+    """
+
     def __init__(self):
-        self._pool = pg_connection_pool()
-        self._con = self._pool.getconn()
+        self._con = psycopg2.connect(
+            DATABASE_URL,
+            connect_timeout=20,
+            application_name="modern_trade_control_tower_v637_cloud",
+            keepalives=1,
+            keepalives_idle=30,
+            keepalives_interval=10,
+            keepalives_count=3,
+        )
         self._closed = False
         self._con.autocommit = False
 
@@ -133,7 +130,8 @@ class PGCompatConnection:
 
         cur = self._con.cursor()
 
-        # Do not pass () to psycopg2 for parameterless queries containing %.
+        # Never pass an empty tuple for parameterless psycopg2 queries that
+        # contain literal percent signs such as LIKE '%FG%'.
         if params:
             cur.execute(translated, tuple(params))
         else:
@@ -165,24 +163,28 @@ class PGCompatConnection:
             return
         self._closed = True
         try:
-            if self._con.get_transaction_status() != pg_extensions.TRANSACTION_STATUS_IDLE:
-                self._con.rollback()
+            # Avoid returning/closing a connection with an open transaction.
+            if not self._con.closed:
+                try:
+                    self._con.rollback()
+                except Exception:
+                    pass
+                self._con.close()
         except Exception:
             pass
-        try:
-            self._pool.putconn(self._con)
-        except Exception:
-            try:
-                self._con.close()
-            except Exception:
-                pass
 
     def cursor(self):
         return self._con.cursor()
 
+    def __del__(self):
+        # Last-resort cleanup for legacy call paths that fail before finally.
+        try:
+            self.close()
+        except Exception:
+            pass
 
 
-@st.cache_resource(show_spinner=False)
+
 def db_engine():
     if not USE_POSTGRES:
         return None
@@ -190,8 +192,8 @@ def db_engine():
     return create_engine(
         DATABASE_URL,
         pool_pre_ping=True,
-        pool_size=5,
-        max_overflow=5,
+        pool_size=1,
+        max_overflow=1,
         pool_recycle=900,
         connect_args={"connect_timeout": 20, "application_name": "modern_trade_control_tower"},
     )
@@ -875,12 +877,18 @@ def pg_insert_dataframe(df, table, conflict="nothing", conflict_column=None, pag
 def read_sql(sql, params=()):
     if USE_POSTGRES:
         con = open_db()
+        cur = None
         try:
             cur = con.execute(sql, params)
             rows = cur.fetchall()
             columns = [d[0] for d in (cur.description or [])]
             return pd.DataFrame(rows, columns=columns)
         finally:
+            try:
+                if cur is not None:
+                    cur.close()
+            except Exception:
+                pass
             con.close()
     con = open_db()
     try:
@@ -1050,12 +1058,36 @@ def save_upload(source_type, f, user):
     con = open_db()
     try:
         duplicate = con.execute(
-            """SELECT id FROM uploads
+            """SELECT id,status,rows_loaded,stored_path FROM uploads
                WHERE file_hash=? AND source_type=?
                ORDER BY id DESC LIMIT 1""",
             (file_hash, source_type)
         ).fetchone()
         if duplicate:
+            # GRN retry rule:
+            # If the exact PDF/Excel was previously stored but produced zero rows
+            # (for example because the GRN Mapping Master had not yet been added),
+            # allow the same file to be processed again instead of blocking it as
+            # a duplicate. Successful GRNs (rows_loaded > 0) remain protected.
+            if str(source_type).strip().upper() == "GRN":
+                prev_rows = int(number_value(duplicate[2]))
+                if prev_rows <= 0:
+                    con.execute(
+                        """UPDATE uploads
+                           SET status=?,uploaded_by=?,uploaded_at=?,file_blob=?
+                           WHERE id=?""",
+                        (
+                            "Reprocessing - mapping/profile updated",
+                            user,
+                            datetime.now().isoformat(timespec="seconds"),
+                            psycopg2.Binary(raw) if USE_POSTGRES else raw,
+                            duplicate[0],
+                        )
+                    )
+                    con.commit()
+                    prev_path = text_value(duplicate[3])
+                    return raw, (Path(prev_path) if prev_path else None), duplicate[0], False
+
             return raw, None, duplicate[0], True
     finally:
         con.close()
@@ -4066,7 +4098,7 @@ def parse_grn_excel_by_mapping(raw):
         con.close()
 
     if not parsed:
-        raise ValueError(f"{profile}: no GRN rows were extracted.")
+        raise ValueError(f"{profile}: no GRN rows were extracted. Check the profile detector, PDF table Start Row and TABLE_COLUMN mappings.")
 
     invalidate_dashboard_cache()
     return {
@@ -4078,6 +4110,19 @@ def parse_grn_excel_by_mapping(raw):
 
 
 def detect_pdf_grn_profile(raw):
+    """
+    Detect the most specific PDF GRN mapping profile.
+
+    Older mapping masters can contain generic profiles such as "Customer C PDF
+    GRN" with a blank detector or a very broad detector such as "GRN". The old
+    implementation returned the first matching profile alphabetically, so those
+    generic profiles could steal Scootsy/Metro/Walmart PDFs before the customer-
+    specific profile was evaluated.
+
+    V63.7 ranks every matching profile and chooses the most specific detector.
+    A profile with a unique GSTIN/customer phrase therefore beats a generic GRN
+    profile. Blank-detector profiles are only a last-resort fallback.
+    """
     if not PDFPLUMBER_AVAILABLE or pdfplumber is None:
         return "", pd.DataFrame(), "", []
 
@@ -4091,13 +4136,58 @@ def detect_pdf_grn_profile(raw):
         for p in pdf.pages:
             tables.extend(p.extract_tables() or [])
 
-    for profile, g in mappings.groupby("profile_name", sort=False):
-        needle = text_value(g.iloc[0].get("detector_contains"))
-        if needle and needle.lower() not in full_text.lower():
-            continue
-        return str(profile), g.reset_index(drop=True), full_text, tables
+    text_l = full_text.lower()
+    candidates = []
 
-    return "", pd.DataFrame(), full_text, tables
+    for profile, g in mappings.groupby("profile_name", sort=False):
+        g = g.reset_index(drop=True)
+
+        # A profile should normally use one detector across all of its rows.
+        detector_values = [
+            text_value(v).strip()
+            for v in g.get("detector_contains", pd.Series(dtype=object)).tolist()
+            if text_value(v).strip()
+        ]
+        needle = detector_values[0] if detector_values else ""
+
+        if needle and needle.lower() not in text_l:
+            continue
+
+        # Required header-regex matches provide a second signal when multiple
+        # profiles share a broad detector.
+        required_hits = 0
+        required_misses = 0
+        for _, m in g.iterrows():
+            if text_value(m.get("field_scope")).upper() != "HEADER":
+                continue
+            if text_value(m.get("source_type")).upper() != "REGEX":
+                continue
+            if text_value(m.get("required")).upper() not in ("YES", "Y", "1", "TRUE"):
+                continue
+            pattern = text_value(m.get("source_reference"))
+            if not pattern:
+                continue
+            try:
+                if re.search(pattern, full_text, flags=re.I | re.S):
+                    required_hits += 1
+                else:
+                    required_misses += 1
+            except re.error:
+                required_misses += 1
+
+        # Specific detector length dominates. Blank detector is deliberately
+        # penalized so it is selected only when no explicit detector matches.
+        detector_score = len(needle) if needle else -1000
+        score = (detector_score, required_hits, -required_misses)
+
+        candidates.append((score, str(profile), g))
+
+    if not candidates:
+        return "", pd.DataFrame(), full_text, tables
+
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    _, profile, chosen = candidates[0]
+    return profile, chosen, full_text, tables
 
 
 def parse_grn_pdf_by_mapping(raw):
@@ -4186,6 +4276,22 @@ def parse_grn_pdf_by_mapping(raw):
                         text_value(values.get("Invoice No")),
                     ]):
                         continue
+
+                    # PDF item-line guard: if a line-level customer/ERP item is
+                    # present, reject obvious header/total rows. This is useful
+                    # for Scootsy-style tables where pdfplumber also returns
+                    # multi-row headers and a Total row in the same table.
+                    item_key = (
+                        text_value(values.get("Customer Item Code"))
+                        or text_value(values.get("ERP Item Code"))
+                    ).strip()
+                    if item_key:
+                        item_key_u = item_key.upper()
+                        if item_key_u in {
+                            "SKU CODE", "ITEM#", "ARTICLE", "TOTAL", "TOTAL:",
+                            "SR. NO.", "SR NO", "S NO"
+                        }:
+                            continue
 
                     if _grn_insert_row(con, values, f"Mapping PDF:{profile}"):
                         added += 1
@@ -7061,7 +7167,7 @@ def b2b_order_staging_excel_bytes(df):
 # UI
 # =========================================================
 with st.sidebar:
-    st.caption("Database: Supabase PostgreSQL • V63.4 FREE LOW-MEMORY" if USE_POSTGRES else "Database: Local SQLite • V63.4 FREE LOW-MEMORY")
+    st.caption("Database: Supabase PostgreSQL • V63.7 GRN PROFILE FIX" if USE_POSTGRES else "Database: Local SQLite • V63.7 GRN PROFILE FIX")
     st.markdown("## Control Tower")
     page = st.radio(
         "Navigation",
@@ -8635,7 +8741,7 @@ elif page == "Upload Centre":
                 try:
                     raw,stored,uid,duplicate = save_upload("GRN",f,user)
                     if duplicate:
-                        st.warning(f"{f.name}: exact same file was already uploaded.")
+                        st.warning(f"{f.name}: exact same GRN was already processed successfully. No duplicate rows were added.")
                         continue
                     if f.name.lower().endswith(".pdf"):
                         result = parse_grn_pdf_by_mapping(raw)
