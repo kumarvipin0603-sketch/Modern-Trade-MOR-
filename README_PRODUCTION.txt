@@ -65,3 +65,49 @@ Fix:
 - No parameters       -> cursor.execute(sql)
 
 No database migration is required for V63.2.
+
+
+V63.3 FAST SUPABASE
+===================
+
+Performance-only release. Existing business rules and Supabase data are not changed.
+
+Main fixes:
+- Reusable ThreadedConnectionPool (max 6) instead of creating a new remote
+  PostgreSQL connection for many individual queries.
+- init_db() / schema compatibility runs once per Streamlit server process.
+- V58 Ship-to seed runs once per process, not on every Streamlit widget rerun.
+- V49 PO mapping schema compatibility runs once per process.
+- PostgreSQL startup/index checks run once.
+- Existing performance index functions are cached.
+- Large source/Main/Factory/B2B/Sales caches use a 5-minute TTL.
+- Existing upload/update functions still clear st.cache_data after mutations,
+  so newly uploaded information remains visible immediately.
+
+No database migration is required.
+Do NOT rerun SQLite-to-Supabase migration.
+
+
+V63.4 FREE LOW-MEMORY — RENDER FREE STABILITY
+==============================================
+
+Reason:
+Render Events reported Exit Status 137, consistent with the web process being
+killed under memory pressure. V63.3 optimized latency by caching multiple large
+pandas DataFrames; on a small Free instance this can retain multiple copies of
+Sale Register / Item Ledger / reconciliation data.
+
+Changes:
+- PostgreSQL client pool reduced from 6 to 2 connections.
+- Removed global cache from cached_table(), preventing persistent copies of
+  every full source table.
+- Removed full Sale Register dataframe cache from Sales & Return 360.
+- Main Reconciliation cache: max 1 entry, 90-second TTL.
+- Factory Requirement cache: max 1 entry, 90-second TTL.
+- PO/B2B caches capped to one entry.
+- Parameterized summary cache capped to 8 entries.
+- Cache invalidation now runs Python garbage collection.
+
+No database migration is required.
+Supabase data is unchanged.
+This build prioritizes Render Free stability over maximum repeated-click speed.

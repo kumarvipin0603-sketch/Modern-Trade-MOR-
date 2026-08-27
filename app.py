@@ -5,8 +5,10 @@ from dotenv import load_dotenv
 import psycopg2
 from psycopg2 import IntegrityError as PGIntegrityError
 from psycopg2.extras import execute_values
+from psycopg2.pool import ThreadedConnectionPool
+from psycopg2 import extensions as pg_extensions
 from sqlalchemy import create_engine
-import sys, subprocess
+import sys, subprocess, gc
 from pathlib import Path
 
 # Optional PDF dependency.
@@ -85,30 +87,65 @@ class PGCompatCursor:
         try: self._cursor.close()
         except Exception: pass
 
+@st.cache_resource(show_spinner=False)
+def pg_connection_pool():
+    """
+    Reusable local client pool for the remote Supabase Session Pooler.
+    Removes repeated TCP/authentication setup on every read_sql/open_db call.
+    """
+    if not USE_POSTGRES:
+        return None
+    return ThreadedConnectionPool(
+        minconn=1,
+        maxconn=2,
+        dsn=DATABASE_URL,
+        connect_timeout=20,
+        application_name="modern_trade_control_tower_v634",
+        keepalives=1,
+        keepalives_idle=30,
+        keepalives_interval=10,
+        keepalives_count=3,
+    )
+
+
 class PGCompatConnection:
     def __init__(self):
-        self._con = psycopg2.connect(DATABASE_URL, connect_timeout=20, application_name="modern_trade_control_tower")
+        self._pool = pg_connection_pool()
+        self._con = self._pool.getconn()
+        self._closed = False
         self._con.autocommit = False
+
     def execute(self, sql, params=()):
         translated = _translate_pg_sql(sql)
-        # The legacy app expects cursor.lastrowid for uploads and manual GRN inserts.
-        returning_id = bool(re.match(r"\s*INSERT\s+INTO\s+(uploads|grn_lines)\b", translated, flags=re.I))
-        if returning_id and "RETURNING" not in translated.upper() and "ON CONFLICT" not in translated.upper():
-            translated = translated.rstrip().rstrip(';') + " RETURNING id"
+        returning_id = bool(
+            re.match(
+                r"\s*INSERT\s+INTO\s+(uploads|grn_lines)\b",
+                translated,
+                flags=re.I,
+            )
+        )
+        if (
+            returning_id
+            and "RETURNING" not in translated.upper()
+            and "ON CONFLICT" not in translated.upper()
+        ):
+            translated = translated.rstrip().rstrip(";") + " RETURNING id"
+
         cur = self._con.cursor()
-        # psycopg2 treats % characters as parameter-format tokens whenever a
-        # second execute() argument is supplied. Many dashboard queries contain
-        # SQL LIKE '%FG%' / '%text%' but no parameters. Passing an empty tuple
-        # therefore raises IndexError: tuple index out of range.
+
+        # Do not pass () to psycopg2 for parameterless queries containing %.
         if params:
             cur.execute(translated, tuple(params))
         else:
             cur.execute(translated)
+
         lastrowid = None
         if returning_id and cur.description:
             row = cur.fetchone()
             lastrowid = row[0] if row else None
+
         return PGCompatCursor(cur, lastrowid)
+
     def executemany(self, sql, seq):
         cur = self._con.cursor()
         seq = list(seq)
@@ -116,11 +153,36 @@ class PGCompatConnection:
             return PGCompatCursor(cur)
         cur.executemany(_translate_pg_sql(sql), seq)
         return PGCompatCursor(cur)
-    def commit(self): self._con.commit()
-    def rollback(self): self._con.rollback()
-    def close(self): self._con.close()
-    def cursor(self): return self._con.cursor()
 
+    def commit(self):
+        self._con.commit()
+
+    def rollback(self):
+        self._con.rollback()
+
+    def close(self):
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            if self._con.get_transaction_status() != pg_extensions.TRANSACTION_STATUS_IDLE:
+                self._con.rollback()
+        except Exception:
+            pass
+        try:
+            self._pool.putconn(self._con)
+        except Exception:
+            try:
+                self._con.close()
+            except Exception:
+                pass
+
+    def cursor(self):
+        return self._con.cursor()
+
+
+
+@st.cache_resource(show_spinner=False)
 def db_engine():
     if not USE_POSTGRES:
         return None
@@ -149,6 +211,7 @@ def open_db():
     con.execute("PRAGMA mmap_size=268435456")
     return con
 
+@st.cache_resource(show_spinner=False)
 def init_db():
     con = open_db()
     try:
@@ -605,7 +668,10 @@ def init_db():
 init_db()
 
 # Production database status and extra PostgreSQL indexes.
-if USE_POSTGRES:
+@st.cache_resource(show_spinner=False)
+def ensure_v63_postgres_indexes_once():
+    if not USE_POSTGRES:
+        return True
     _pg_idx = open_db()
     try:
         for _sql in [
@@ -613,81 +679,97 @@ if USE_POSTGRES:
             "CREATE INDEX IF NOT EXISTS idx_ship_ledger_pin_v63 ON ship_to_location_master(ledger_name, pin_code)",
             "CREATE INDEX IF NOT EXISTS idx_sale_business_key_v63 ON sale_register(business_key)",
         ]:
-            try: _pg_idx.execute(_sql)
-            except Exception: _pg_idx.rollback()
+            try:
+                _pg_idx.execute(_sql)
+            except Exception:
+                _pg_idx.rollback()
         _pg_idx.commit()
     finally:
         _pg_idx.close()
+    return True
+
+ensure_v63_postgres_indexes_once()
 
 # V58 baseline Ship-to mappings supplied by user.
-_seed_ship_to_v58 = [
-    ("BI Worldwide India Private Limited","600077","BI-CHENNAI"),
-    ("BLINK COMMERCE PRIVATE LIMITED","121006","FBD-BLINK"),
-    ("BLINK COMMERCE PRIVATE LIMITED","140417","PATIALA"),
-    ("BLINK COMMERCE PRIVATE LIMITED","201306","NOIDA -N1"),
-    ("BLINK COMMERCE PRIVATE LIMITED","302037","RJ-BLINK"),
-    ("BLINK COMMERCE PRIVATE LIMITED","382213","AHMD A2"),
-    ("BLINK COMMERCE PRIVATE LIMITED","403501","GOA"),
-    ("BLINK COMMERCE PRIVATE LIMITED","410501","NIGHOJE"),
-    ("BLINK COMMERCE PRIVATE LIMITED","410506","PUNE P2"),
-    ("BLINK COMMERCE PRIVATE LIMITED","421306","MUM - M10"),
-    ("BLINK COMMERCE PRIVATE LIMITED","441501","NR-BLINK"),
-    ("BLINK COMMERCE PRIVATE LIMITED","500101","HYD - H3"),
-    ("BLINK COMMERCE PRIVATE LIMITED","520007","VIJAYAWADA"),
-    ("BLINK COMMERCE PRIVATE LIMITED","531173","AP-BLINK"),
-    ("BLINK COMMERCE PRIVATE LIMITED","562106","BGLR - B3"),
-    ("BLINK COMMERCE PRIVATE LIMITED","562114","DODDENAHAL"),
-    ("BLINK COMMERCE PRIVATE LIMITED","600052","CHEN C5"),
-]
-_seed_con_v58 = open_db()
-try:
-    for _ledger,_pin,_code in _seed_ship_to_v58:
-        _old = _seed_con_v58.execute(
-            """SELECT id FROM ship_to_location_master
-               WHERE UPPER(TRIM(ledger_name))=UPPER(TRIM(?))
-                 AND pin_code=? LIMIT 1""",
-            (_ledger,_pin)
-        ).fetchone()
-        if _old:
-            _seed_con_v58.execute(
-                """UPDATE ship_to_location_master
-                   SET ship_to_location_code=?,
-                       updated_by='V58 baseline',
-                       updated_at=?
-                   WHERE id=?""",
-                (_code, datetime.now().isoformat(timespec="seconds"), _old[0])
-            )
-        else:
-            _seed_con_v58.execute(
-                """INSERT INTO ship_to_location_master(
-                   ledger_name,pin_code,ship_to_location_code,
-                   ship_to_location_name,updated_by,updated_at
-                ) VALUES(?,?,?,?,?,?)""",
-                (_ledger,_pin,_code,"","V58 baseline",
-                 datetime.now().isoformat(timespec="seconds"))
-            )
-    _seed_con_v58.commit()
-finally:
-    _seed_con_v58.close()
+@st.cache_resource(show_spinner=False)
+def seed_ship_to_baseline_once():
+    _seed_ship_to_v58 = [
+        ("BI Worldwide India Private Limited","600077","BI-CHENNAI"),
+        ("BLINK COMMERCE PRIVATE LIMITED","121006","FBD-BLINK"),
+        ("BLINK COMMERCE PRIVATE LIMITED","140417","PATIALA"),
+        ("BLINK COMMERCE PRIVATE LIMITED","201306","NOIDA -N1"),
+        ("BLINK COMMERCE PRIVATE LIMITED","302037","RJ-BLINK"),
+        ("BLINK COMMERCE PRIVATE LIMITED","382213","AHMD A2"),
+        ("BLINK COMMERCE PRIVATE LIMITED","403501","GOA"),
+        ("BLINK COMMERCE PRIVATE LIMITED","410501","NIGHOJE"),
+        ("BLINK COMMERCE PRIVATE LIMITED","410506","PUNE P2"),
+        ("BLINK COMMERCE PRIVATE LIMITED","421306","MUM - M10"),
+        ("BLINK COMMERCE PRIVATE LIMITED","441501","NR-BLINK"),
+        ("BLINK COMMERCE PRIVATE LIMITED","500101","HYD - H3"),
+        ("BLINK COMMERCE PRIVATE LIMITED","520007","VIJAYAWADA"),
+        ("BLINK COMMERCE PRIVATE LIMITED","531173","AP-BLINK"),
+        ("BLINK COMMERCE PRIVATE LIMITED","562106","BGLR - B3"),
+        ("BLINK COMMERCE PRIVATE LIMITED","562114","DODDENAHAL"),
+        ("BLINK COMMERCE PRIVATE LIMITED","600052","CHEN C5"),
+    ]
+    _seed_con_v58 = open_db()
+    try:
+        for _ledger,_pin,_code in _seed_ship_to_v58:
+            _old = _seed_con_v58.execute(
+                """SELECT id FROM ship_to_location_master
+                   WHERE UPPER(TRIM(ledger_name))=UPPER(TRIM(?))
+                     AND pin_code=? LIMIT 1""",
+                (_ledger,_pin)
+            ).fetchone()
+            if _old:
+                _seed_con_v58.execute(
+                    """UPDATE ship_to_location_master
+                       SET ship_to_location_code=?,
+                           updated_by='V58 baseline',
+                           updated_at=?
+                       WHERE id=?""",
+                    (_code, datetime.now().isoformat(timespec="seconds"), _old[0])
+                )
+            else:
+                _seed_con_v58.execute(
+                    """INSERT INTO ship_to_location_master(
+                       ledger_name,pin_code,ship_to_location_code,
+                       ship_to_location_name,updated_by,updated_at
+                    ) VALUES(?,?,?,?,?,?)""",
+                    (_ledger,_pin,_code,"","V58 baseline",
+                     datetime.now().isoformat(timespec="seconds"))
+                )
+        _seed_con_v58.commit()
+    finally:
+        _seed_con_v58.close()
+    return True
+
+seed_ship_to_baseline_once()
 
 # V49 PO Mapping Master compatibility columns.
+@st.cache_resource(show_spinner=False)
+def ensure_po_mapping_compat_once():
 
-_con_v49 = open_db()
-try:
-    if USE_POSTGRES:
-        _cols_v49 = {r[0] for r in _con_v49.execute(
-            "SELECT column_name FROM information_schema.columns WHERE table_schema='public' AND table_name='po_mapping_master'"
-        ).fetchall()}
-    else:
-        _cols_v49 = {r[1] for r in _con_v49.execute("PRAGMA table_info(po_mapping_master)").fetchall()}
-    if "page_no" not in _cols_v49:
-        _con_v49.execute("ALTER TABLE po_mapping_master ADD COLUMN page_no INTEGER")
-    if "table_no" not in _cols_v49:
-        _con_v49.execute("ALTER TABLE po_mapping_master ADD COLUMN table_no INTEGER")
-    _con_v49.commit()
-finally:
-    _con_v49.close()
+    _con_v49 = open_db()
+    try:
+        if USE_POSTGRES:
+            _cols_v49 = {r[0] for r in _con_v49.execute(
+                "SELECT column_name FROM information_schema.columns WHERE table_schema='public' AND table_name='po_mapping_master'"
+            ).fetchall()}
+        else:
+            _cols_v49 = {r[1] for r in _con_v49.execute("PRAGMA table_info(po_mapping_master)").fetchall()}
+        if "page_no" not in _cols_v49:
+            _con_v49.execute("ALTER TABLE po_mapping_master ADD COLUMN page_no INTEGER")
+        if "table_no" not in _cols_v49:
+            _con_v49.execute("ALTER TABLE po_mapping_master ADD COLUMN table_no INTEGER")
+        _con_v49.commit()
+    finally:
+        _con_v49.close()
+    return True
 
+ensure_po_mapping_compat_once()
+
+@st.cache_resource(show_spinner=False)
 def ensure_sale_register_unique_index():
     """
     Safe startup only.
@@ -714,6 +796,7 @@ try:
 except Exception:
     pass
 
+@st.cache_resource(show_spinner=False)
 def create_performance_indexes():
     """Indexes used by PO search, FY filters, ledger filters and 360° dashboards."""
     con = open_db()
@@ -1021,6 +1104,12 @@ def materialize_upload_if_missing(upload_id, stored_path, file_name="source.bin"
 def invalidate_dashboard_cache():
     try:
         st.cache_data.clear()
+    except Exception:
+        pass
+    # Render Free has tight memory. Promptly collect dataframe/cache objects
+    # released after an upload or database mutation.
+    try:
+        gc.collect()
     except Exception:
         pass
 
@@ -2832,7 +2921,7 @@ def import_ship_to_location_master(df, user):
     invalidate_dashboard_cache()
     return added, updated, skipped
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=300, max_entries=1)
 def ship_to_master_fast_maps():
     """
     Exact rule: canonical Ledger Name + 6-digit PIN -> Ship-to Location Code.
@@ -2865,7 +2954,7 @@ def ship_to_master_fast_maps():
     return exact, unique_pin
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=300, max_entries=1)
 def sale_ship_source_by_po():
     """
     Latest available Sale Register shipping source by PO.
@@ -4314,7 +4403,7 @@ def sale_split(df):
     return x.loc[is_sale].copy(), x.loc[is_return].copy()
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=120, max_entries=8)
 def sale_return_control_totals_db(
     financial_year="All",
     po_list=None,
@@ -4522,7 +4611,7 @@ def fg_stock(sku, branch=""):
         return 0.0
     return pd.to_numeric(d["remaining_qty"], errors="coerce").fillna(0).sum()
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=300, max_entries=1)
 def stock_by_sku():
     d = read_sql(
         """SELECT erp_item_code,
@@ -5269,15 +5358,14 @@ def safe_table_count(table_name):
         return 0
 
 
-@st.cache_data(show_spinner=False)
 def cached_table(table_name):
     return read_sql(f"SELECT * FROM {table_name}")
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=300, max_entries=1)
 def cached_stock_by_sku():
     return stock_by_sku()
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=90, max_entries=1)
 def available_main_dashboard():
     """
     Fast vectorized reconciliation.
@@ -5741,8 +5829,7 @@ def available_main_dashboard():
     return out[MAIN_COLUMNS]
 
 
-@st.cache_data(show_spinner=False)
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=90, max_entries=1)
 def factory_requirement_available_df(branch_filter="All Branches", financial_year="All"):
     """
     Fast Factory requirement by ERP item with branch-aware FG stock.
@@ -5874,7 +5961,6 @@ def factory_requirement_available_df(branch_filter="All Branches", financial_yea
     ).reset_index(drop=True)
 
 
-@st.cache_data(show_spinner=False)
 def sales_return_available_df():
     """
     Directly returns the consolidated Sale Register and guarantees the 360°
@@ -6232,7 +6318,7 @@ def apply_financial_year_filter(df, fy_value, preferred_date_columns):
 # =========================================================
 # LIVE CUSTOMER PO -> MAIN RECONCILIATION OVERLAY
 # =========================================================
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=300, max_entries=1)
 def _sku_master_fast_maps():
     """
     Build normalized Customer Item -> ERP lookup maps once per call.
@@ -6364,7 +6450,7 @@ def refresh_po_erp_mappings_live():
 
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=120, max_entries=1)
 def live_po_source():
     """
     Direct current PO source, enriched in-memory with one fast SKU-master map.
@@ -6813,7 +6899,7 @@ def overlay_live_po_details(data):
 
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=300, max_entries=1)
 def factory_branch_options():
     d = read_sql(
         """SELECT DISTINCT branch_code
@@ -6853,7 +6939,7 @@ def uploaded_po_keys():
     }
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=120, max_entries=1)
 def build_b2b_order_staging():
     """
     One output row per uploaded PO line, following the attached B2B staging
@@ -6948,7 +7034,7 @@ def build_b2b_order_staging():
     return pd.DataFrame(rows, columns=B2B_STAGING_COLUMNS)
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=120, max_entries=1)
 def b2b_order_staging_excel_bytes(df):
     out = io.BytesIO()
     with pd.ExcelWriter(out, engine="openpyxl") as writer:
@@ -6975,7 +7061,7 @@ def b2b_order_staging_excel_bytes(df):
 # UI
 # =========================================================
 with st.sidebar:
-    st.caption("Database: Supabase PostgreSQL" if USE_POSTGRES else "Database: Local SQLite")
+    st.caption("Database: Supabase PostgreSQL • V63.4 FREE LOW-MEMORY" if USE_POSTGRES else "Database: Local SQLite • V63.4 FREE LOW-MEMORY")
     st.markdown("## Control Tower")
     page = st.radio(
         "Navigation",
