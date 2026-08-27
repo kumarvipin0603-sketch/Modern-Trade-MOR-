@@ -103,7 +103,7 @@ class PGCompatConnection:
         self._con = psycopg2.connect(
             DATABASE_URL,
             connect_timeout=20,
-            application_name="modern_trade_control_tower_v637_cloud",
+            application_name="modern_trade_control_tower_v638_cloud",
             keepalives=1,
             keepalives_idle=30,
             keepalives_interval=10,
@@ -381,6 +381,7 @@ def init_db():
             ledger_name TEXT,
             invoice_no TEXT,
             invoice_date TEXT,
+            customer_item_code TEXT,
             erp_item_code TEXT,
             item_description TEXT,
             invoice_qty REAL,
@@ -610,7 +611,7 @@ def init_db():
         # GRN compatibility.
         grn_expected = [
             ("po_no","TEXT"),("ledger_name","TEXT"),("invoice_no","TEXT"),
-            ("invoice_date","TEXT"),("erp_item_code","TEXT"),
+            ("invoice_date","TEXT"),("customer_item_code","TEXT"),("erp_item_code","TEXT"),
             ("item_description","TEXT"),("invoice_qty","REAL"),
             ("transporter","TEXT"),("docket_no","TEXT"),("grn_no","TEXT"),
             ("grn_date","TEXT"),("grn_qty","REAL"),("delivery_cancel_date","TEXT"),
@@ -1064,29 +1065,26 @@ def save_upload(source_type, f, user):
             (file_hash, source_type)
         ).fetchone()
         if duplicate:
-            # GRN retry rule:
-            # If the exact PDF/Excel was previously stored but produced zero rows
-            # (for example because the GRN Mapping Master had not yet been added),
-            # allow the same file to be processed again instead of blocking it as
-            # a duplicate. Successful GRNs (rows_loaded > 0) remain protected.
+            # GRN files may be reprocessed after mapping/master fixes.
+            # Duplicate GRN *rows* are still protected by source_key +
+            # ON CONFLICT DO NOTHING, so retrying a file cannot duplicate an
+            # already-normalized GRN row.
             if str(source_type).strip().upper() == "GRN":
-                prev_rows = int(number_value(duplicate[2]))
-                if prev_rows <= 0:
-                    con.execute(
-                        """UPDATE uploads
-                           SET status=?,uploaded_by=?,uploaded_at=?,file_blob=?
-                           WHERE id=?""",
-                        (
-                            "Reprocessing - mapping/profile updated",
-                            user,
-                            datetime.now().isoformat(timespec="seconds"),
-                            psycopg2.Binary(raw) if USE_POSTGRES else raw,
-                            duplicate[0],
-                        )
+                con.execute(
+                    """UPDATE uploads
+                       SET status=?,uploaded_by=?,uploaded_at=?,file_blob=?
+                       WHERE id=?""",
+                    (
+                        "Reprocessing GRN - row-level duplicate guard active",
+                        user,
+                        datetime.now().isoformat(timespec="seconds"),
+                        psycopg2.Binary(raw) if USE_POSTGRES else raw,
+                        duplicate[0],
                     )
-                    con.commit()
-                    prev_path = text_value(duplicate[3])
-                    return raw, (Path(prev_path) if prev_path else None), duplicate[0], False
+                )
+                con.commit()
+                prev_path = text_value(duplicate[3])
+                return raw, (Path(prev_path) if prev_path else None), duplicate[0], False
 
             return raw, None, duplicate[0], True
     finally:
@@ -3927,48 +3925,119 @@ def detect_excel_grn_profile(raw):
 
 def _grn_insert_row(con, values, source_type):
     """
-    Insert one normalized GRN row. Exact duplicate key is ignored.
+    Insert one normalized GRN row.
+
+    V63.8 rule:
+    Customer Item Code from GRN is preserved and ERP Item is resolved using:
+      1. Uploaded PO line (PO No + Customer Item Code)
+      2. Customer SKU & Price Master
+      3. Unique matching ERP from Sale Register for the same PO/Invoice
+    Exact duplicate normalized rows remain protected by source_key.
     """
     po = text_value(values.get("PO No"))
     invoice = text_value(values.get("Invoice No"))
     grn = text_value(values.get("GRN No"))
-    erp = text_value(values.get("ERP Item Code"))
+    ledger = text_value(values.get("Ledger Name"))
+    customer_item = canonical_customer_item(values.get("Customer Item Code"))
+    erp = text_value(values.get("ERP Item Code")).strip()
     qty = number_value(values.get("GRN Qty"))
 
-    if not erp:
-        customer_item = canonical_customer_item(values.get("Customer Item Code"))
-        ledger = text_value(values.get("Ledger Name"))
-        if customer_item:
-            erp, master_desc, _master_price = resolve_po_erp_item(
-                con, ledger, customer_item
-            )
-            if erp and not text_value(values.get("Item Description")):
-                values["Item Description"] = master_desc
-            values["ERP Item Code"] = erp
+    # 1) Prefer the ERP mapping already established on the uploaded PO line.
+    if not erp and po and customer_item:
+        po_rows = con.execute(
+            """SELECT erp_item_code,item_description
+               FROM po_lines
+               WHERE UPPER(TRIM(COALESCE(po_no,'')))=UPPER(TRIM(?))
+                 AND TRIM(COALESCE(customer_item_code,''))<>''
+                 AND TRIM(COALESCE(erp_item_code,''))<>''
+               ORDER BY id DESC""",
+            (po,)
+        ).fetchall()
+        matches = []
+        for r in po_rows:
+            # Fetch customer item separately only for rows that share the PO.
+            # This keeps SQL portable between SQLite and PostgreSQL.
+            pass
 
+        po_rows2 = con.execute(
+            """SELECT customer_item_code,erp_item_code,item_description
+               FROM po_lines
+               WHERE UPPER(TRIM(COALESCE(po_no,'')))=UPPER(TRIM(?))
+                 AND TRIM(COALESCE(erp_item_code,''))<>''""",
+            (po,)
+        ).fetchall()
+        unique_po = {}
+        for r in po_rows2:
+            if canonical_customer_item(r[0]) != customer_item:
+                continue
+            key = text_value(r[1]).strip().upper()
+            if key:
+                unique_po[key] = r
+        if len(unique_po) == 1:
+            r = next(iter(unique_po.values()))
+            erp = text_value(r[1]).strip()
+            if erp and not text_value(values.get("Item Description")):
+                values["Item Description"] = text_value(r[2])
+
+    # 2) Customer SKU master fallback.
+    if not erp and customer_item:
+        erp2, master_desc, _master_price = resolve_po_erp_item(
+            con, ledger, customer_item
+        )
+        erp = text_value(erp2).strip()
+        if erp and not text_value(values.get("Item Description")):
+            values["Item Description"] = master_desc
+
+    # 3) Final conservative fallback: if same PO+invoice has exactly one ERP
+    # item in Sale Register, it is safe to use it. This is only for single-line
+    # invoices; multi-line invoices are intentionally left unresolved.
+    if not erp and po and invoice:
+        sale_rows = con.execute(
+            """SELECT DISTINCT erp_item_code
+               FROM sale_register
+               WHERE UPPER(TRIM(COALESCE(po_no,'')))=UPPER(TRIM(?))
+                 AND UPPER(TRIM(COALESCE(invoice_no,'')))=UPPER(TRIM(?))
+                 AND TRIM(COALESCE(erp_item_code,''))<>''""",
+            (po, invoice)
+        ).fetchall()
+        sale_erps = sorted({
+            text_value(r[0]).strip()
+            for r in sale_rows
+            if text_value(r[0]).strip()
+        })
+        if len(sale_erps) == 1:
+            erp = sale_erps[0]
+
+    values["ERP Item Code"] = erp
+    values["Customer Item Code"] = customer_item
+
+    # Include Customer Item in the key so an unresolved historical row and a
+    # later corrected ERP-resolved row can coexist without corrupting either.
     key = hashlib.sha1(
-        f"{po}|{invoice}|{grn}|{text_value(values.get('ERP Item Code'))}|{qty}".encode()
+        f"{po}|{invoice}|{grn}|{customer_item}|{erp}|{qty}".encode()
     ).hexdigest()
 
     try:
         _sql_grn = """INSERT INTO grn_lines(
                 source_key,po_no,ledger_name,invoice_no,invoice_date,
-                erp_item_code,item_description,invoice_qty,transporter,docket_no,
-                grn_no,grn_date,grn_qty,delivery_cancel_date,delivery_remarks,
-                short_delivered,mir_no,sumit_invoice_upload,pod_remarks,status,
-                source_type,updated_at
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"""
+                customer_item_code,erp_item_code,item_description,invoice_qty,
+                transporter,docket_no,grn_no,grn_date,grn_qty,
+                delivery_cancel_date,delivery_remarks,short_delivered,mir_no,
+                sumit_invoice_upload,pod_remarks,status,source_type,updated_at
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"""
         if USE_POSTGRES:
             _sql_grn += " ON CONFLICT (source_key) DO NOTHING"
+
         _cur_grn = con.execute(
             _sql_grn,
             (
                 key,
                 po,
-                text_value(values.get("Ledger Name")),
+                ledger,
                 invoice,
                 date_value(values.get("Invoice Date")),
-                text_value(values.get("ERP Item Code")),
+                customer_item,
+                erp,
                 text_value(values.get("Item Description")),
                 number_value(values.get("Invoice Qty")),
                 text_value(values.get("Transporter")),
@@ -3992,7 +4061,6 @@ def _grn_insert_row(con, values, source_type):
         if USE_POSTGRES:
             con.rollback()
         return False
-
 
 def parse_grn_excel_by_mapping(raw):
     profile, mappings = detect_excel_grn_profile(raw)
@@ -4281,6 +4349,14 @@ def parse_grn_pdf_by_mapping(raw):
                     # present, reject obvious header/total rows. This is useful
                     # for Scootsy-style tables where pdfplumber also returns
                     # multi-row headers and a Total row in the same table.
+                    # Scootsy PDFs include multiple header rows and a Total
+                    # row in the same extracted table. Accept only true item
+                    # rows (numeric Sr. No.) when this layout is detected.
+                    if "SCOOTSY LOGISTICS PRIVATE LIMITED" in full_text.upper():
+                        sr_no = text_value(row[0]).strip() if len(row) > 0 else ""
+                        if not re.fullmatch(r"\d+", sr_no):
+                            continue
+
                     item_key = (
                         text_value(values.get("Customer Item Code"))
                         or text_value(values.get("ERP Item Code"))
@@ -4352,8 +4428,8 @@ def reprocess_stored_grn_files():
 
             update_upload(
                 int(u["id"]),
-                f"Processed - GRN Mapping Master: {result['profile']}",
-                len(result["rows"])
+                f"Processed - GRN Mapping Master: {result['profile']} | New rows: {result['added']} | Duplicates: {result['duplicates']}",
+                int(result["added"])
             )
             files_done += 1
             rows_done += len(result["rows"])
@@ -5642,6 +5718,44 @@ def available_main_dashboard():
 
     # GRN aggregation by PO+Invoice+SKU.
     if not grn.empty:
+        # V63.8 in-memory repair for historical GRN rows that were stored
+        # before Customer Item Code -> ERP mapping was available.
+        if "customer_item_code" not in grn.columns:
+            grn["customer_item_code"] = ""
+        if not po.empty:
+            po_map = po.copy()
+            if "customer_item_code" not in po_map.columns:
+                po_map["customer_item_code"] = ""
+            po_map["_cust_k"] = (
+                po_map["customer_item_code"].fillna("").astype(str)
+                .map(canonical_customer_item)
+            )
+            po_map = po_map[
+                (po_map["_cust_k"] != "") &
+                (po_map["erp_item_code"].fillna("").astype(str).str.strip() != "")
+            ][["po_no_k","_cust_k","erp_item_code"]].drop_duplicates()
+
+            grn["_cust_k"] = (
+                grn["customer_item_code"].fillna("").astype(str)
+                .map(canonical_customer_item)
+            )
+            missing_erp = grn["erp_item_code_k"].fillna("").astype(str).str.strip().eq("")
+            if missing_erp.any():
+                repaired = grn.loc[missing_erp, ["po_no_k","_cust_k"]].merge(
+                    po_map,
+                    on=["po_no_k","_cust_k"],
+                    how="left"
+                )
+                # Align by original missing-row order.
+                candidate = repaired["erp_item_code"].fillna("").astype(str).values
+                idxs = grn.index[missing_erp]
+                if len(candidate) == len(idxs):
+                    grn.loc[idxs, "erp_item_code"] = candidate
+                    grn.loc[idxs, "erp_item_code_k"] = (
+                        grn.loc[idxs, "erp_item_code"].fillna("").astype(str)
+                        .str.strip().str.upper()
+                    )
+
         grn["grn_qty"] = pd.to_numeric(grn.get("grn_qty",0),errors="coerce").fillna(0)
         grn["short_delivered"] = pd.to_numeric(grn.get("short_delivered",0),errors="coerce").fillna(0)
         ggrp = grn.groupby(["po_no_k","invoice_no_k","erp_item_code_k"],dropna=False).agg(
@@ -7167,7 +7281,7 @@ def b2b_order_staging_excel_bytes(df):
 # UI
 # =========================================================
 with st.sidebar:
-    st.caption("Database: Supabase PostgreSQL • V63.7 GRN PROFILE FIX" if USE_POSTGRES else "Database: Local SQLite • V63.7 GRN PROFILE FIX")
+    st.caption("Database: Supabase PostgreSQL • V63.8 GRN RECONCILIATION FIX" if USE_POSTGRES else "Database: Local SQLite • V63.8 GRN RECONCILIATION FIX")
     st.markdown("## Control Tower")
     page = st.radio(
         "Navigation",
