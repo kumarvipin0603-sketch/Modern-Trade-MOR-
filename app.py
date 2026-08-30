@@ -103,7 +103,7 @@ class PGCompatConnection:
         self._con = psycopg2.connect(
             DATABASE_URL,
             connect_timeout=20,
-            application_name="modern_trade_control_tower_v638_cloud",
+            application_name="modern_trade_control_tower_v6311_cloud",
             keepalives=1,
             keepalives_idle=30,
             keepalives_interval=10,
@@ -414,6 +414,39 @@ def init_db():
             changed_by TEXT,
             changed_at TEXT
         )""")
+
+        # V63.10 authoritative GRN working-sheet override.
+        # One row = one exact reconciliation line (PO + Invoice + ERP Item).
+        # Values saved from the dashboard or uploaded completed GRN Working Sheet
+        # must override raw/imported GRN aggregation in Main Reconciliation.
+        con.execute("""CREATE TABLE IF NOT EXISTS grn_reconciliation_override(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            po_no TEXT NOT NULL DEFAULT '',
+            invoice_no TEXT NOT NULL DEFAULT '',
+            erp_item_code TEXT NOT NULL DEFAULT '',
+            grn_no TEXT,
+            grn_date TEXT,
+            grn_qty REAL,
+            delivery_cancel_date TEXT,
+            delivery_remarks TEXT,
+            short_delivered REAL,
+            mir_no TEXT,
+            sumit_invoice_upload TEXT,
+            pod_remarks TEXT,
+            changed_by TEXT,
+            reason TEXT,
+            updated_at TEXT
+        )""")
+        try:
+            con.execute(
+                """CREATE UNIQUE INDEX IF NOT EXISTS ux_grn_recon_override_key
+                   ON grn_reconciliation_override(po_no,invoice_no,erp_item_code)"""
+            )
+        except Exception:
+            try:
+                con.rollback()
+            except Exception:
+                pass
 
         con.execute("""CREATE TABLE IF NOT EXISTS grn_mapping_master(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1065,17 +1098,31 @@ def save_upload(source_type, f, user):
             (file_hash, source_type)
         ).fetchone()
         if duplicate:
-            # GRN files may be reprocessed after mapping/master fixes.
-            # Duplicate GRN *rows* are still protected by source_key +
-            # ON CONFLICT DO NOTHING, so retrying a file cannot duplicate an
-            # already-normalized GRN row.
-            if str(source_type).strip().upper() == "GRN":
+            source_u = str(source_type).strip().upper()
+
+            # GRN and Customer PO may be safely reprocessed.
+            #
+            # Customer PO rule:
+            # Billing can already exist for some SKUs before the complete PO is
+            # uploaded. Therefore the file-level hash must never prevent the PO
+            # parser from running. Row-level PO upsert will update existing SKU
+            # lines and insert only missing SKU lines.
+            #
+            # GRN rule:
+            # Mapping/master fixes may require the same source GRN to be parsed
+            # again; normalized GRN row keys protect against duplicate rows.
+            if source_u in ("GRN", "CUSTOMER PO"):
+                status_text = (
+                    "Reprocessing Customer PO - incremental SKU merge"
+                    if source_u == "CUSTOMER PO"
+                    else "Reprocessing GRN - row-level duplicate guard active"
+                )
                 con.execute(
                     """UPDATE uploads
                        SET status=?,uploaded_by=?,uploaded_at=?,file_blob=?
                        WHERE id=?""",
                     (
-                        "Reprocessing GRN - row-level duplicate guard active",
+                        status_text,
                         user,
                         datetime.now().isoformat(timespec="seconds"),
                         psycopg2.Binary(raw) if USE_POSTGRES else raw,
@@ -2294,14 +2341,36 @@ def upsert_po_line(
     po_value,
     ship_to_location,
 ):
-    """Insert/update one Customer PO line without creating duplicates."""
+    """
+    Incremental Customer PO merge.
+
+    One PO SKU line is identified by:
+        Ledger + PO No + Customer Item Code
+
+    Why ERP Item is NOT part of the identity:
+    ERP mapping may be blank during an earlier upload and become available
+    later. That must update the same customer SKU line rather than create a
+    second PO line.
+
+    Result:
+    - Existing SKU in the PO -> update latest PO/header/value details.
+    - Missing SKU in the PO  -> insert it.
+    - Re-upload same complete PO -> no duplicate SKU rows.
+    """
+    ledger = text_value(ledger).strip()
+    po_no = text_value(po_no).strip()
+    customer_item_code = canonical_customer_item(customer_item_code)
+    erp_item_code = text_value(erp_item_code).strip()
+
     old = con.execute(
-        """SELECT id FROM po_lines
+        """SELECT id
+           FROM po_lines
            WHERE UPPER(TRIM(COALESCE(ledger_name,'')))=UPPER(TRIM(?))
              AND UPPER(TRIM(COALESCE(po_no,'')))=UPPER(TRIM(?))
              AND UPPER(TRIM(COALESCE(customer_item_code,'')))=UPPER(TRIM(?))
-             AND UPPER(TRIM(COALESCE(erp_item_code,'')))=UPPER(TRIM(?))""",
-        (ledger, po_no, customer_item_code, erp_item_code)
+           ORDER BY id ASC
+           LIMIT 1""",
+        (ledger, po_no, customer_item_code)
     ).fetchone()
 
     values = (
@@ -2321,6 +2390,17 @@ def upsert_po_line(
                WHERE id=?""",
             values + (old[0],)
         )
+
+        # Repair historical duplicate PO rows for the same customer SKU that
+        # may have been created when ERP mapping changed between uploads.
+        con.execute(
+            """DELETE FROM po_lines
+               WHERE id<>?
+                 AND UPPER(TRIM(COALESCE(ledger_name,'')))=UPPER(TRIM(?))
+                 AND UPPER(TRIM(COALESCE(po_no,'')))=UPPER(TRIM(?))
+                 AND UPPER(TRIM(COALESCE(customer_item_code,'')))=UPPER(TRIM(?))""",
+            (old[0], ledger, po_no, customer_item_code)
+        )
         return "updated"
 
     con.execute(
@@ -2333,6 +2413,7 @@ def upsert_po_line(
         values
     )
     return "added"
+
 
 
 def _po_pdf_date(value):
@@ -4243,10 +4324,25 @@ def detect_pdf_grn_profile(raw):
             except re.error:
                 required_misses += 1
 
-        # Specific detector length dominates. Blank detector is deliberately
-        # penalized so it is selected only when no explicit detector matches.
+        # Detector specificity:
+        # A GSTIN/site-code detector is materially more specific than a generic
+        # company heading such as "SCOOTSY LOGISTICS PRIVATE LIMITED".
+        # This prevents a generic Scootsy profile from stealing a Coimbatore/
+        # site-specific PDF even if the company heading is a longer string.
+        needle_compact = re.sub(r"\s+", "", needle.upper())
+        is_gstin = bool(re.fullmatch(r"\d{2}[A-Z0-9]{13}", needle_compact))
+        has_digit = bool(re.search(r"\d", needle))
+        token_count = len(re.findall(r"[A-Z0-9]+", needle.upper()))
         detector_score = len(needle) if needle else -1000
-        score = (detector_score, required_hits, -required_misses)
+
+        score = (
+            1 if is_gstin else 0,
+            1 if has_digit else 0,
+            detector_score,
+            required_hits,
+            -required_misses,
+            token_count,
+        )
 
         candidates.append((score, str(profile), g))
 
@@ -5382,6 +5478,58 @@ def _grn_existing_row(con, po_no, invoice_no, sku):
         (po_no, invoice_no, sku)
     ).fetchone()
 
+def _upsert_grn_reconciliation_override(con, po_no, invoice_no, sku, values, changed_by, reason):
+    """Persist an authoritative GRN value for one reconciliation row."""
+    po_no = text_value(po_no).strip()
+    invoice_no = text_value(invoice_no).strip()
+    sku = text_value(sku).strip()
+
+    payload = (
+        text_value(values.get("grn_no")),
+        date_value(values.get("grn_date")),
+        number_value(values.get("grn_qty")),
+        date_value(values.get("delivery_cancel_date")),
+        text_value(values.get("delivery_remarks")),
+        number_value(values.get("short_delivered")),
+        text_value(values.get("mir_no")),
+        text_value(values.get("sumit_invoice_upload")),
+        text_value(values.get("pod_remarks")),
+        text_value(changed_by),
+        text_value(reason),
+        datetime.now().isoformat(timespec="seconds"),
+    )
+
+    existing = con.execute(
+        """SELECT id FROM grn_reconciliation_override
+           WHERE UPPER(TRIM(COALESCE(po_no,'')))=UPPER(TRIM(?))
+             AND UPPER(TRIM(COALESCE(invoice_no,'')))=UPPER(TRIM(?))
+             AND UPPER(TRIM(COALESCE(erp_item_code,'')))=UPPER(TRIM(?))
+           ORDER BY id DESC LIMIT 1""",
+        (po_no, invoice_no, sku)
+    ).fetchone()
+
+    if existing:
+        con.execute(
+            """UPDATE grn_reconciliation_override SET
+               grn_no=?,grn_date=?,grn_qty=?,
+               delivery_cancel_date=?,delivery_remarks=?,short_delivered=?,
+               mir_no=?,sumit_invoice_upload=?,pod_remarks=?,
+               changed_by=?,reason=?,updated_at=?
+               WHERE id=?""",
+            payload + (existing[0],)
+        )
+    else:
+        con.execute(
+            """INSERT INTO grn_reconciliation_override(
+               po_no,invoice_no,erp_item_code,
+               grn_no,grn_date,grn_qty,
+               delivery_cancel_date,delivery_remarks,short_delivered,
+               mir_no,sumit_invoice_upload,pod_remarks,
+               changed_by,reason,updated_at
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (po_no, invoice_no, sku) + payload
+        )
+
 def save_grn_working_changes(working_df, changed_by, reason="Main reconciliation GRN working update"):
     """Upsert only GRN fields using PO + Invoice + ERP Item as reconciliation key."""
     if working_df is None or working_df.empty:
@@ -5416,6 +5564,14 @@ def save_grn_working_changes(working_df, changed_by, reason="Main reconciliation
                 "sumit_invoice_upload": _clean_excel_value(row.get("Sumit Invoice upload")),
                 "pod_remarks": _clean_excel_value(row.get("POD Remarks")),
             }
+
+            # V63.10: the completed GRN Working Sheet is authoritative for the
+            # exact reconciliation line. This override is applied after all
+            # imported/raw GRN aggregation, so a manually corrected 37 can never
+            # be re-expanded to 74 by duplicate source GRN rows.
+            _upsert_grn_reconciliation_override(
+                con, po_no, invoice_no, sku, new_values, changed_by, reason
+            )
 
             existing = _grn_existing_row(con, po_no, invoice_no, sku)
             if existing:
@@ -5509,6 +5665,10 @@ def save_grn_working_changes(working_df, changed_by, reason="Main reconciliation
                 saved += 1
 
         con.commit()
+        try:
+            st.cache_data.clear()
+        except Exception:
+            pass
         return saved, audited
     finally:
         con.close()
@@ -5716,12 +5876,24 @@ def available_main_dashboard():
     else:
         inv["_cn_no"]=""; inv["_cn_date"]=""; inv["_cn_qty"]=0.0; inv["_cn_value"]=0.0
 
-    # GRN aggregation by PO+Invoice+SKU.
+    # GRN aggregation.
+    #
+    # V63.9 rules:
+    # 1. Re-uploading the same physical GRN must NEVER double GRN Qty.
+    # 2. Distinct GRN numbers for the same PO/SKU remain additive (partial receipts).
+    # 3. Exact PO+Invoice+ERP match is preferred.
+    # 4. If invoice text is blank/different, PO+ERP fallback is allowed only when
+    #    that PO+ERP has one reconciliation invoice row (or the invoice is blank),
+    #    so we do not repeat one GRN across multiple invoices.
     if not grn.empty:
-        # V63.8 in-memory repair for historical GRN rows that were stored
-        # before Customer Item Code -> ERP mapping was available.
         if "customer_item_code" not in grn.columns:
             grn["customer_item_code"] = ""
+        if "grn_no" not in grn.columns:
+            grn["grn_no"] = ""
+        if "id" not in grn.columns:
+            grn["id"] = range(1, len(grn) + 1)
+
+        # Repair blank ERP from PO customer-item mapping.
         if not po.empty:
             po_map = po.copy()
             if "customer_item_code" not in po_map.columns:
@@ -5739,34 +5911,80 @@ def available_main_dashboard():
                 grn["customer_item_code"].fillna("").astype(str)
                 .map(canonical_customer_item)
             )
-            missing_erp = grn["erp_item_code_k"].fillna("").astype(str).str.strip().eq("")
-            if missing_erp.any():
-                repaired = grn.loc[missing_erp, ["po_no_k","_cust_k"]].merge(
-                    po_map,
-                    on=["po_no_k","_cust_k"],
-                    how="left"
-                )
-                # Align by original missing-row order.
-                candidate = repaired["erp_item_code"].fillna("").astype(str).values
-                idxs = grn.index[missing_erp]
-                if len(candidate) == len(idxs):
-                    grn.loc[idxs, "erp_item_code"] = candidate
-                    grn.loc[idxs, "erp_item_code_k"] = (
-                        grn.loc[idxs, "erp_item_code"].fillna("").astype(str)
-                        .str.strip().str.upper()
-                    )
 
-        grn["grn_qty"] = pd.to_numeric(grn.get("grn_qty",0),errors="coerce").fillna(0)
-        grn["short_delivered"] = pd.to_numeric(grn.get("short_delivered",0),errors="coerce").fillna(0)
-        ggrp = grn.groupby(["po_no_k","invoice_no_k","erp_item_code_k"],dropna=False).agg(
-            _grn_qty=("grn_qty","sum"),
+            # Use a dictionary so duplicate PO mapping rows cannot expand the
+            # GRN dataframe during merge/alignment.
+            po_lookup = {}
+            for _, rr in po_map.iterrows():
+                kk = (text_value(rr["po_no_k"]), text_value(rr["_cust_k"]))
+                ev = text_value(rr["erp_item_code"]).strip()
+                if kk[0] and kk[1] and ev:
+                    po_lookup.setdefault(kk, set()).add(ev)
+
+            missing_erp = grn["erp_item_code_k"].fillna("").astype(str).str.strip().eq("")
+            for ix in grn.index[missing_erp]:
+                kk = (
+                    text_value(grn.at[ix, "po_no_k"]),
+                    text_value(grn.at[ix, "_cust_k"])
+                )
+                vals = po_lookup.get(kk, set())
+                if len(vals) == 1:
+                    erp_val = next(iter(vals))
+                    grn.at[ix, "erp_item_code"] = erp_val
+                    grn.at[ix, "erp_item_code_k"] = erp_val.strip().upper()
+        else:
+            grn["_cust_k"] = (
+                grn["customer_item_code"].fillna("").astype(str)
+                .map(canonical_customer_item)
+            )
+
+        # Normalized GRN identity.
+        grn["_grn_no_k"] = (
+            grn["grn_no"].fillna("").astype(str).str.strip().str.upper()
+        )
+        grn["grn_qty"] = pd.to_numeric(
+            grn.get("grn_qty", 0), errors="coerce"
+        ).fillna(0)
+        grn["short_delivered"] = pd.to_numeric(
+            grn.get("short_delivered", 0), errors="coerce"
+        ).fillna(0)
+
+        # Ignore parser junk that cannot reconcile to a real ERP item.
+        grn_valid = grn[
+            grn["po_no_k"].fillna("").astype(str).str.strip().ne("") &
+            grn["erp_item_code_k"].fillna("").astype(str).str.strip().ne("")
+        ].copy()
+
+        # A physical GRN line identity is PO + GRN No + ERP Item + Customer Item.
+        # Same line uploaded twice -> keep one quantity, NOT sum both.
+        # If Customer Item is absent in an older row, ERP still protects the line.
+        grn_valid["_logical_customer"] = grn_valid["_cust_k"].where(
+            grn_valid["_cust_k"].fillna("").astype(str).str.strip().ne(""),
+            grn_valid["erp_item_code_k"]
+        )
+
+        logical_cols = [
+            "po_no_k", "_grn_no_k", "erp_item_code_k", "_logical_customer"
+        ]
+
+        # Prefer the latest row for text fields, but GRN quantity itself is
+        # canonicalized with MAX inside the logical group. That fixes historical
+        # 37+37=74 / 60+60=120 duplicate uploads without deleting source audit rows.
+        grn_valid = grn_valid.sort_values("id", kind="stable")
+
+        logical = grn_valid.groupby(logical_cols, dropna=False, sort=False).agg(
+            invoice_no_k=("invoice_no_k", lambda x: next(
+                (str(v).strip().upper() for v in reversed(list(x))
+                 if pd.notna(v) and str(v).strip()), ""
+            )),
+            _grn_qty=("grn_qty","max"),
             _delivery_cancel=("delivery_cancel_date", lambda x: ", ".join(sorted(set(
                 str(v).strip() for v in x if pd.notna(v) and str(v).strip()
             )))),
             _delivery_remarks=("delivery_remarks", lambda x: "; ".join(sorted(set(
                 str(v).strip() for v in x if pd.notna(v) and str(v).strip()
             )))),
-            _short=("short_delivered","sum"),
+            _short=("short_delivered","max"),
             _mir=("mir_no", lambda x: ", ".join(sorted(set(
                 str(v).strip() for v in x if pd.notna(v) and str(v).strip()
             )))),
@@ -5777,7 +5995,103 @@ def available_main_dashboard():
                 str(v).strip() for v in x if pd.notna(v) and str(v).strip()
             ))))
         ).reset_index()
-        inv = inv.merge(ggrp,on=["po_no_k","invoice_no_k","erp_item_code_k"],how="left")
+
+        # Distinct GRN numbers remain additive.
+        exact = logical.groupby(
+            ["po_no_k","invoice_no_k","erp_item_code_k"], dropna=False
+        ).agg(
+            _grn_qty=("_grn_qty","sum"),
+            _delivery_cancel=("_delivery_cancel", lambda x: ", ".join(sorted(set(
+                str(v).strip() for v in x if pd.notna(v) and str(v).strip()
+            )))),
+            _delivery_remarks=("_delivery_remarks", lambda x: "; ".join(sorted(set(
+                str(v).strip() for v in x if pd.notna(v) and str(v).strip()
+            )))),
+            _short=("_short","sum"),
+            _mir=("_mir", lambda x: ", ".join(sorted(set(
+                str(v).strip() for v in x if pd.notna(v) and str(v).strip()
+            )))),
+            _sumit=("_sumit", lambda x: ", ".join(sorted(set(
+                str(v).strip() for v in x if pd.notna(v) and str(v).strip()
+            )))),
+            _pod=("_pod", lambda x: "; ".join(sorted(set(
+                str(v).strip() for v in x if pd.notna(v) and str(v).strip()
+            ))))
+        ).reset_index()
+
+        inv = inv.merge(
+            exact,
+            on=["po_no_k","invoice_no_k","erp_item_code_k"],
+            how="left"
+        )
+
+        # PO+ERP fallback for uploaded GRN where invoice text does not match the
+        # Sale Register or billing is not yet present.
+        po_sku = logical.groupby(
+            ["po_no_k","erp_item_code_k"], dropna=False
+        ).agg(
+            _grn_qty_po=("_grn_qty","sum"),
+            _delivery_cancel_po=("_delivery_cancel", lambda x: ", ".join(sorted(set(
+                str(v).strip() for v in x if pd.notna(v) and str(v).strip()
+            )))),
+            _delivery_remarks_po=("_delivery_remarks", lambda x: "; ".join(sorted(set(
+                str(v).strip() for v in x if pd.notna(v) and str(v).strip()
+            )))),
+            _short_po=("_short","sum"),
+            _mir_po=("_mir", lambda x: ", ".join(sorted(set(
+                str(v).strip() for v in x if pd.notna(v) and str(v).strip()
+            )))),
+            _sumit_po=("_sumit", lambda x: ", ".join(sorted(set(
+                str(v).strip() for v in x if pd.notna(v) and str(v).strip()
+            )))),
+            _pod_po=("_pod", lambda x: "; ".join(sorted(set(
+                str(v).strip() for v in x if pd.notna(v) and str(v).strip()
+            ))))
+        ).reset_index()
+
+        inv = inv.merge(po_sku, on=["po_no_k","erp_item_code_k"], how="left")
+
+        # Count reconciliation invoice rows per PO+ERP to prevent fallback GRN
+        # from being repeated across several invoice rows.
+        inv["_po_erp_inv_rows"] = inv.groupby(
+            ["po_no_k","erp_item_code_k"], dropna=False
+        )["invoice_no_k"].transform("size")
+
+        exact_missing = pd.to_numeric(
+            inv.get("_grn_qty", 0), errors="coerce"
+        ).fillna(0).eq(0)
+
+        fallback_allowed = (
+            inv["invoice_no_k"].fillna("").astype(str).str.strip().eq("")
+            | inv["_po_erp_inv_rows"].fillna(0).le(1)
+        )
+
+        use_fallback = exact_missing & fallback_allowed
+
+        for base, fb in [
+            ("_grn_qty","_grn_qty_po"),
+            ("_delivery_cancel","_delivery_cancel_po"),
+            ("_delivery_remarks","_delivery_remarks_po"),
+            ("_short","_short_po"),
+            ("_mir","_mir_po"),
+            ("_sumit","_sumit_po"),
+            ("_pod","_pod_po"),
+        ]:
+            if base not in inv.columns:
+                inv[base] = 0.0 if base in ("_grn_qty","_short") else ""
+            if fb not in inv.columns:
+                continue
+            inv.loc[use_fallback, base] = inv.loc[use_fallback, fb]
+
+        # Remove helper fallback columns from the working frame.
+        inv.drop(
+            columns=[
+                "_grn_qty_po","_delivery_cancel_po","_delivery_remarks_po",
+                "_short_po","_mir_po","_sumit_po","_pod_po","_po_erp_inv_rows"
+            ],
+            errors="ignore",
+            inplace=True
+        )
     else:
         for c in ["_grn_qty","_delivery_cancel","_delivery_remarks","_short","_mir","_sumit","_pod"]:
             inv[c] = 0.0 if c in ["_grn_qty","_short"] else ""
@@ -5877,6 +6191,98 @@ def available_main_dashboard():
     out["POD Remarks"] = inv["_pod"].fillna("")
     out["Reconciliation Remarks"] = ""
     out["Assigned Remarks"] = ""
+
+    # =========================================================
+    # V63.10 AUTHORITATIVE GRN WORKING-SHEET OVERRIDE
+    # =========================================================
+    # Raw/imported GRNs are source evidence. A completed GRN Working Sheet or
+    # direct "Save GRN Changes" action is the user's final reconciliation value
+    # for that exact PO + Invoice + ERP Item line and must take precedence.
+    try:
+        grn_override = read_sql(
+            """SELECT
+               po_no,invoice_no,erp_item_code,
+               grn_no,grn_date,grn_qty,
+               delivery_cancel_date,delivery_remarks,short_delivered,
+               mir_no,sumit_invoice_upload,pod_remarks
+               FROM grn_reconciliation_override"""
+        )
+    except Exception:
+        grn_override = pd.DataFrame()
+
+    if not grn_override.empty and not out.empty:
+        ov = grn_override.copy()
+        ov["_po_k"] = ov["po_no"].fillna("").astype(str).str.strip().str.upper()
+        ov["_inv_k"] = ov["invoice_no"].fillna("").astype(str).str.strip().str.upper()
+        ov["_sku_k"] = ov["erp_item_code"].fillna("").astype(str).str.strip().str.upper()
+
+        # Latest override wins if historical duplicate override rows exist.
+        ov = ov.drop_duplicates(["_po_k","_inv_k","_sku_k"], keep="last")
+
+        out["_po_k_override"] = out["Po Number"].fillna("").astype(str).str.strip().str.upper()
+        out["_inv_k_override"] = out["Invoice No"].fillna("").astype(str).str.strip().str.upper()
+        out["_sku_k_override"] = out["Product/Item No"].fillna("").astype(str).str.strip().str.upper()
+
+        ov_cols = {
+            "grn_no": "_ov_grn_no",
+            "grn_date": "_ov_grn_date",
+            "grn_qty": "_ov_grn_qty",
+            "delivery_cancel_date": "_ov_delivery_cancel",
+            "delivery_remarks": "_ov_delivery_remarks",
+            "short_delivered": "_ov_short",
+            "mir_no": "_ov_mir",
+            "sumit_invoice_upload": "_ov_sumit",
+            "pod_remarks": "_ov_pod",
+        }
+        ov = ov.rename(columns=ov_cols)
+
+        out = out.merge(
+            ov[
+                ["_po_k","_inv_k","_sku_k"] + list(ov_cols.values())
+            ],
+            left_on=["_po_k_override","_inv_k_override","_sku_k_override"],
+            right_on=["_po_k","_inv_k","_sku_k"],
+            how="left"
+        )
+
+        has_override = out["_ov_grn_qty"].notna()
+
+        # Qty: explicit working-sheet value always wins, including 0.
+        out.loc[has_override, "GRN Qty"] = pd.to_numeric(
+            out.loc[has_override, "_ov_grn_qty"], errors="coerce"
+        ).fillna(0)
+
+        text_pairs = [
+            ("GRN No.", "_ov_grn_no"),
+            ("GRN Date", "_ov_grn_date"),
+            ("Delivery/Cancel Date", "_ov_delivery_cancel"),
+            ("Delivery Remarks", "_ov_delivery_remarks"),
+            ("MIR No.", "_ov_mir"),
+            ("Sumit Invoice upload", "_ov_sumit"),
+            ("POD Remarks", "_ov_pod"),
+        ]
+        for target, source in text_pairs:
+            if target not in out.columns:
+                out[target] = ""
+            out.loc[has_override, target] = (
+                out.loc[has_override, source].fillna("").astype(str)
+            )
+
+        out.loc[has_override, "Short Delivered"] = pd.to_numeric(
+            out.loc[has_override, "_ov_short"], errors="coerce"
+        ).fillna(0)
+
+        out.drop(
+            columns=[
+                "_po_k_override","_inv_k_override","_sku_k_override",
+                "_po_k","_inv_k","_sku_k",
+                "_ov_grn_no","_ov_grn_date","_ov_grn_qty",
+                "_ov_delivery_cancel","_ov_delivery_remarks","_ov_short",
+                "_ov_mir","_ov_sumit","_ov_pod",
+            ],
+            errors="ignore",
+            inplace=True
+        )
 
     # =========================================================
     # APPEND CUSTOMER PO LINES NOT REPRESENTED BY SALE REGISTER
@@ -7281,7 +7687,7 @@ def b2b_order_staging_excel_bytes(df):
 # UI
 # =========================================================
 with st.sidebar:
-    st.caption("Database: Supabase PostgreSQL • V63.8 GRN RECONCILIATION FIX" if USE_POSTGRES else "Database: Local SQLite • V63.8 GRN RECONCILIATION FIX")
+    st.caption("Database: Supabase PostgreSQL • V63.11 PO INCREMENTAL MERGE FIX" if USE_POSTGRES else "Database: Local SQLite • V63.11 PO INCREMENTAL MERGE FIX")
     st.markdown("## Control Tower")
     page = st.radio(
         "Navigation",
@@ -7743,9 +8149,9 @@ if page == "Main Reconciliation Dashboard":
                 width="stretch"
             )
 
-        st.markdown("#### Upload Completed GRN Working Sheet")
+        st.markdown("#### Upload Completed GRN Working Sheet — Final Override")
         uploaded_grn_work = st.file_uploader(
-            "Upload the completed GRN working Excel downloaded above",
+            "Upload the completed GRN working Excel downloaded above. Values in this file become the final Main Reconciliation GRN values for matching PO + Invoice + Item rows.",
             type=["xlsx","xls"],
             key=f"main_grn_upload_{('_'.join(selected_pos) if selected_pos else 'ALL')}"
         )
@@ -7761,7 +8167,7 @@ if page == "Main Reconciliation Dashboard":
                         user,
                         f"Uploaded GRN working sheet: {uploaded_grn_work.name}"
                     )
-                    st.success(f"{saved} GRN reconciliation row(s) updated; {audited} audit change(s) logged.")
+                    st.success(f"{saved} GRN source row(s) updated; {audited} audit change(s) logged. Uploaded working-sheet values are now the final Main Reconciliation override.")
                     st.rerun()
                 except Exception as e:
                     st.error(f"Could not apply GRN working sheet: {e}")
@@ -8662,7 +9068,7 @@ elif page == "Upload Centre":
                     raw,stored,uid,duplicate = save_upload("Customer PO",f,user)
 
                     if duplicate:
-                        st.warning(duplicate_upload_message(f.name, "Customer PO"))
+                        st.warning(f"{f.name}: file already exists, but Customer PO files are normally reprocessed using incremental SKU merge. Please refresh and retry.")
                         continue
 
                     if f.name.lower().endswith(".pdf"):
@@ -8672,7 +9078,11 @@ elif page == "Upload Centre":
                         if result is None:
                             result = process_customer_po_pdf(raw, f.name, uid)
 
-                        update_upload(uid,"Processed",len(result["rows"]))
+                        update_upload(
+                            uid,
+                            f"Processed - Customer PO incremental merge | Added {result['added']} | Updated {result['updated']}",
+                            int(result["added"])
+                        )
                         st.success(
                             f"{f.name}: {result.get('profile','Customer PDF')} | "
                             f"PO {result['po_no']} parsed — "
@@ -8696,8 +9106,8 @@ elif page == "Upload Centre":
                         if result is not None:
                             update_upload(
                                 uid,
-                                f"Processed - PO Mapping Master: {result['profile']}",
-                                len(result["rows"])
+                                f"Processed - PO Mapping Master: {result['profile']} | Added {result['added']} | Updated {result['updated']}",
+                                int(result["added"])
                             )
                             st.success(
                                 f"{f.name}: Mapping Profile '{result['profile']}' | "
