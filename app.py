@@ -20,6 +20,7 @@ except Exception as e:
     pdfplumber = None
     PDFPLUMBER_ERROR = str(e)
 from datetime import datetime
+import openpyxl
 from openpyxl.styles import Font, Alignment
 
 st.set_page_config(
@@ -103,7 +104,7 @@ class PGCompatConnection:
         self._con = psycopg2.connect(
             DATABASE_URL,
             connect_timeout=20,
-            application_name="modern_trade_control_tower_v6311_cloud",
+            application_name="modern_trade_control_tower_v6312_cloud",
             keepalives=1,
             keepalives_idle=30,
             keepalives_interval=10,
@@ -5754,6 +5755,67 @@ def available_main_dashboard():
     # Do not collapse distinct ERP rows again at dashboard level.
     inv = inv.copy()
 
+    # V63.12 PO ERP REPAIR
+    # Historical PO rows can have Customer Item populated while ERP Item is blank.
+    # Repair them from Customer SKU & Price Master before matching to Sale Register.
+    if not po.empty:
+        for c in ["customer_item_code","ledger_name","erp_item_code","item_description"]:
+            if c not in po.columns:
+                po[c] = ""
+
+        try:
+            sku_master_for_po = cached_table("sku_master").copy()
+        except Exception:
+            sku_master_for_po = pd.DataFrame()
+
+        if not sku_master_for_po.empty:
+            for c in ["ledger_name","customer_item_code","erp_item_code","item_description"]:
+                if c not in sku_master_for_po.columns:
+                    sku_master_for_po[c] = ""
+
+            sku_master_for_po["_ledger_k"] = (
+                sku_master_for_po["ledger_name"].fillna("").astype(str)
+                .str.strip().str.upper()
+            )
+            sku_master_for_po["_cust_k"] = (
+                sku_master_for_po["customer_item_code"].fillna("").astype(str)
+                .map(canonical_customer_item)
+            )
+            sku_master_for_po["_erp_clean"] = (
+                sku_master_for_po["erp_item_code"].fillna("").astype(str).str.strip()
+            )
+            usable = sku_master_for_po[
+                (sku_master_for_po["_cust_k"] != "") &
+                (sku_master_for_po["_erp_clean"] != "")
+            ].copy()
+
+            grouped = usable.groupby(
+                ["_ledger_k","_cust_k"], dropna=False
+            )["_erp_clean"].agg(lambda x: sorted(set(v for v in x if v))).reset_index()
+            grouped = grouped[grouped["_erp_clean"].map(len) == 1].copy()
+            erp_lookup = {
+                (r["_ledger_k"], r["_cust_k"]): r["_erp_clean"][0]
+                for _, r in grouped.iterrows()
+            }
+
+            desc_lookup = {}
+            for _, r in usable.iterrows():
+                k = (r["_ledger_k"], r["_cust_k"])
+                if k in erp_lookup and k not in desc_lookup:
+                    desc_lookup[k] = text_value(r.get("item_description"))
+
+            missing_po_erp = po["erp_item_code"].fillna("").astype(str).str.strip().eq("")
+            for ix in po.index[missing_po_erp]:
+                k = (
+                    text_value(po.at[ix, "ledger_name"]).strip().upper(),
+                    canonical_customer_item(po.at[ix, "customer_item_code"])
+                )
+                erp_val = erp_lookup.get(k, "")
+                if erp_val:
+                    po.at[ix, "erp_item_code"] = erp_val
+                    if not text_value(po.at[ix, "item_description"]).strip():
+                        po.at[ix, "item_description"] = desc_lookup.get(k, "")
+
     # Normalized join keys.
     for df, cols in [
         (inv, ["po_no","erp_item_code","invoice_no"]),
@@ -5768,8 +5830,15 @@ def available_main_dashboard():
                 df[c] = ""
             df[c + "_k"] = df[c].fillna("").astype(str).str.strip().str.upper()
 
-    # PO line: one line per PO+SKU for enrichment.
+    # PO line: one customer SKU row is authoritative inside each PO.
     if not po.empty:
+        po["_customer_item_k"] = (
+            po["customer_item_code"].fillna("").astype(str).map(canonical_customer_item)
+        )
+        po = po.sort_values("id" if "id" in po.columns else "po_no").drop_duplicates(
+            ["po_no_k","_customer_item_k"], keep="last"
+        ).copy()
+
         po_fast = po.sort_values("id" if "id" in po.columns else "po_no").drop_duplicates(
             ["po_no_k","erp_item_code_k"], keep="last"
         )
@@ -7687,7 +7756,7 @@ def b2b_order_staging_excel_bytes(df):
 # UI
 # =========================================================
 with st.sidebar:
-    st.caption("Database: Supabase PostgreSQL • V63.11 PO INCREMENTAL MERGE FIX" if USE_POSTGRES else "Database: Local SQLite • V63.11 PO INCREMENTAL MERGE FIX")
+    st.caption("Database: Supabase PostgreSQL • V63.12 PO FULL ENRICHMENT FIX" if USE_POSTGRES else "Database: Local SQLite • V63.12 PO FULL ENRICHMENT FIX")
     st.markdown("## Control Tower")
     page = st.radio(
         "Navigation",
