@@ -104,7 +104,7 @@ class PGCompatConnection:
         self._con = psycopg2.connect(
             DATABASE_URL,
             connect_timeout=20,
-            application_name="modern_trade_control_tower_v6314_cloud",
+            application_name="modern_trade_control_tower_v6315_cloud",
             keepalives=1,
             keepalives_idle=30,
             keepalives_interval=10,
@@ -317,6 +317,8 @@ def init_db():
             po_no TEXT PRIMARY KEY,
             erp_sales_order_no TEXT,
             ledger_name TEXT,
+            user_id TEXT,
+            created_date TEXT,
             updated_at TEXT
         )""")
 
@@ -581,6 +583,9 @@ def init_db():
         # Invoice/CN/SR row from being inserted again even if parser versions
         # or non-business metadata change between uploads.
         ensure_column("sale_register", "business_key", "TEXT")
+        ensure_column("sale_register", "user_id", "TEXT")
+        ensure_column("sales_order_map", "user_id", "TEXT")
+        ensure_column("sales_order_map", "created_date", "TEXT")
 
         sale_expected = [
             ("sales_order_no","TEXT"),("order_date","TEXT"),("invoice_no","TEXT"),
@@ -1695,6 +1700,14 @@ def parse_customer_po_excel_by_mapping(raw, source_file, upload_id):
             if not po_value and qty and unit_price:
                 po_value = qty * unit_price
 
+            profile_u = profile.upper()
+            if ("CP WHOLESALE" in profile_u or "LOTS" in profile_u) and unit_price:
+                unit_price = unit_price / 1.18
+            elif "FLIPKART" in profile_u and unit_price:
+                unit_price = unit_price / 1.18
+            elif "BI WORLDWIDE" in profile_u and po_value and qty:
+                unit_price = po_value / qty / 1.18
+
             action = upsert_po_line(
                 con,
                 source_file=source_file,
@@ -2045,42 +2058,56 @@ def parse_customer_po_pdf_by_mapping(raw, source_file, upload_id):
             if hinted:
                 candidates = hinted
 
-        best = None
-        best_score = 0
+        scored = []
         for rec in candidates:
             score = _score_pdf_table_for_po(rec["table"], line_maps, start_idx)
-            if score > best_score:
-                best_score = score
-                best = rec
+            if score > 0:
+                scored.append((score, rec))
 
-        # If hints were wrong/stale, retry against every table automatically.
-        if best is None or best_score == 0:
+        if not scored:
             for rec in table_records:
                 score = _score_pdf_table_for_po(rec["table"], line_maps, start_idx)
-                if score > best_score:
-                    best_score = score
-                    best = rec
+                if score > 0:
+                    scored.append((score, rec))
 
-        if best is None or best_score == 0:
+        if not scored:
             raise ValueError(
                 f"{profile}: no PDF PO line rows were extracted. "
                 f"Detected {len(table_records)} PDF table(s) across all pages, "
                 "but none matched the active line-column mapping."
             )
 
-        selected_page = best["page_no"]
-        selected_table = best["table_no"]
+        selected_page = "ALL"
+        selected_table = "ALL"
+        seen_pdf_lines = set()
 
-        for row_idx, row in enumerate(best["table"]):
-            if row_idx < start_idx or not row:
-                continue
-            values = _pdf_row_values_from_mapping(row, line_maps)
-            customer_item = canonical_customer_item(values.get("Customer Item Code"))
-            qty = number_value(values.get("PO Qty"))
-            po_value = number_value(values.get("PO Value"))
-            if not customer_item or (qty == 0 and po_value == 0):
-                continue
-            candidate_rows.append(values)
+        for _score, rec in scored:
+            for row_idx, row in enumerate(rec["table"]):
+                if row_idx < start_idx or not row:
+                    continue
+                values = _pdf_row_values_from_mapping(row, line_maps)
+
+                if "BLINK" in profile.upper() and len(row) >= 13:
+                    values["PO Qty"] = number_value(row[10])
+                    values["PO Unit Price"] = number_value(row[11])
+                    values["PO Value"] = number_value(row[12])
+
+                customer_item = canonical_customer_item(values.get("Customer Item Code"))
+                qty = number_value(values.get("PO Qty"))
+                po_value = number_value(values.get("PO Value"))
+                if not customer_item or customer_item.upper().startswith("TOTAL"):
+                    continue
+                if qty == 0 and po_value == 0:
+                    continue
+
+                logical = (
+                    customer_item.upper(), qty, po_value,
+                    number_value(values.get("PO Unit Price"))
+                )
+                if logical in seen_pdf_lines:
+                    continue
+                seen_pdf_lines.add(logical)
+                candidate_rows.append(values)
 
     con = open_db()
     added = updated = unmapped = 0
@@ -2813,6 +2840,11 @@ def import_flipkart_po_excel(raw, source_file, upload_id):
                 continue
             blank_run = 0
 
+            customer_item_u = customer_item.upper()
+            if "TOTAL" in customer_item_u or "=" in customer_item_u:
+                skipped += 1
+                continue
+
             # A valid Flipkart item line must have a quantity or value.
             qty = number_value(qty_raw)
             po_value = number_value(value_raw)
@@ -3385,6 +3417,7 @@ def prepare_sale_register(df):
     out["sub_division"] = series_text(df, find_col(df, ["Sub-Division"]))
     out["post_code"] = series_text(df, find_col(df, ["Post Code"]))
     out["city"] = series_text(df, find_col(df, ["City"]))
+    out["user_id"] = series_text(df, find_col(df, A["user"]))
 
     # ERP SALE REGISTER LOCKED RULE:
     # Document Type is the primary transaction classifier.
@@ -3584,6 +3617,11 @@ def import_sales_orders(df):
 
     c_so = df.columns[0]   # Column A
     c_po = df.columns[3]   # Column D
+    c_user = find_col(df, A["user"])
+    c_created_date = find_col(
+        df,
+        ["Created Date","SO Created Date","Sales Order Date","Order Date","Posting Date","Date"]
+    )
 
     con = open_db()
     updated = skipped = 0
@@ -3596,26 +3634,45 @@ def import_sales_orders(df):
                 skipped += 1
                 continue
 
+            source_user = text_value(r.get(c_user)) if c_user is not None else ""
+            if not source_user:
+                source_user = text_value(globals().get("user", ""))
+            created_date = (
+                date_value(r.get(c_created_date))
+                if c_created_date is not None
+                else datetime.now().strftime("%Y-%m-%d")
+            )
+
             existing = con.execute(
-                """SELECT erp_sales_order_no FROM sales_order_map
+                """SELECT erp_sales_order_no,user_id,created_date
+                   FROM sales_order_map
                    WHERE po_no=? LIMIT 1""",
                 (po,)
             ).fetchone()
-            if existing and text_value(existing[0]).strip() == so.strip():
+            if (
+                existing
+                and text_value(existing[0]).strip() == so.strip()
+                and text_value(existing[1]).strip() == source_user.strip()
+                and text_value(existing[2]).strip() == created_date.strip()
+            ):
                 skipped += 1
                 continue
 
             con.execute(
                 """INSERT INTO sales_order_map(
-                       po_no,erp_sales_order_no,ledger_name,updated_at
-                   ) VALUES(?,?,?,?)
+                       po_no,erp_sales_order_no,ledger_name,user_id,created_date,updated_at
+                   ) VALUES(?,?,?,?,?,?)
                    ON CONFLICT(po_no) DO UPDATE SET
                        erp_sales_order_no=excluded.erp_sales_order_no,
+                       user_id=excluded.user_id,
+                       created_date=excluded.created_date,
                        updated_at=excluded.updated_at""",
                 (
                     po,
                     so,
                     "",
+                    source_user,
+                    created_date,
                     datetime.now().isoformat(timespec="seconds")
                 )
             )
@@ -7702,6 +7759,11 @@ def build_b2b_order_staging():
         erp_item = text_value(r.get("erp_item_code")).strip()
         so_no = so_by_po.get(po_key, "")
 
+        qty_b2b = number_value(r.get("po_qty"))
+        price_b2b = number_value(r.get("po_unit_price"))
+        if "BLINK" in ledger.upper() and qty_b2b > 500 and 0 < price_b2b <= 500:
+            qty_b2b, price_b2b = price_b2b, qty_b2b
+
         missing = []
         if not customer_no:
             missing.append("Customer No")
@@ -7718,8 +7780,8 @@ def build_b2b_order_staging():
             "Customer PO Date": text_value(r.get("po_date")),
             "Posting Date": posting_date,
             "Item No.": erp_item,
-            "Quantity": number_value(r.get("po_qty")),
-            "Unit Price": number_value(r.get("po_unit_price")),
+            "Quantity": qty_b2b,
+            "Unit Price": price_b2b,
             "Status": "Ready" if not missing else "Mapping Pending: " + ", ".join(missing),
             "Sales Order No.": so_no,
             "So Created": 1 if so_no else 0,
@@ -7748,15 +7810,67 @@ def b2b_order_staging_excel_bytes(df):
             cell.font = Font(bold=True)
             cell.alignment = Alignment(horizontal="center")
 
+        for cell in ws["D"][1:]:
+            cell.number_format = "@"
+            if cell.value is not None:
+                cell.value = str(cell.value)
+
     return out.getvalue()
 
 
+
+
+@st.cache_data(show_spinner=False, ttl=120, max_entries=4)
+def user_working_summary(period_mode="Daily", selected_day=None, selected_month=None):
+    so = read_sql("""SELECT erp_sales_order_no,user_id,created_date
+                     FROM sales_order_map
+                     WHERE TRIM(COALESCE(erp_sales_order_no,''))<>''""")
+    inv = read_sql("""SELECT invoice_no,invoice_date,user_id,gross_amount,document_type
+                      FROM sale_register
+                      WHERE TRIM(COALESCE(invoice_no,''))<>''""")
+
+    if selected_day is None:
+        selected_day = datetime.now().date()
+    day_str = pd.Timestamp(selected_day).strftime("%Y-%m-%d")
+    month_str = str(selected_month or pd.Timestamp(selected_day).strftime("%Y-%m"))
+
+    if not so.empty:
+        so["created_date"] = so["created_date"].fillna("").astype(str).str[:10]
+        so["user_id"] = so["user_id"].fillna("").astype(str).str.strip()
+        so = so[so["user_id"] != ""].copy()
+        if period_mode == "Daily":
+            so = so[so["created_date"] == day_str].copy()
+        else:
+            so = so[so["created_date"].str[:7] == month_str].copy()
+
+    if not inv.empty:
+        inv["invoice_date"] = inv["invoice_date"].fillna("").astype(str).str[:10]
+        inv["user_id"] = inv["user_id"].fillna("").astype(str).str.strip()
+        inv["gross_amount"] = pd.to_numeric(inv["gross_amount"], errors="coerce").fillna(0)
+        doc = inv["document_type"].fillna("").astype(str).str.strip().str.upper()
+        inv = inv[(inv["user_id"] != "") & ((doc == "INVOICE") | (doc == ""))].copy()
+        if period_mode == "Daily":
+            inv = inv[inv["invoice_date"] == day_str].copy()
+        else:
+            inv = inv[inv["invoice_date"].str[:7] == month_str].copy()
+
+    so_g = so.groupby("user_id")["erp_sales_order_no"].nunique() if not so.empty else pd.Series(dtype="int64")
+    inv_g = inv.groupby("user_id")["invoice_no"].nunique() if not inv.empty else pd.Series(dtype="int64")
+    val_g = inv.groupby("user_id")["gross_amount"].sum() if not inv.empty else pd.Series(dtype="float64")
+    users = sorted(set(so_g.index) | set(inv_g.index) | set(val_g.index))
+    return pd.DataFrame([
+        {"User ID":u,
+         "Sales Orders":int(so_g.get(u,0)),
+         "Invoices":int(inv_g.get(u,0)),
+         "Invoice Value":float(val_g.get(u,0.0))}
+        for u in users
+    ], columns=["User ID","Sales Orders","Invoices","Invoice Value"])
 
 # =========================================================
 # UI
 # =========================================================
 with st.sidebar:
-    st.caption("Database: Supabase PostgreSQL • V63.14 B2B SEARCH COLUMN FIX" if USE_POSTGRES else "Database: Local SQLite • V63.14 B2B SEARCH COLUMN FIX")
+    st.caption("Database: Supabase PostgreSQL • V63.15 B2B REVIEW + USER COUNT" if USE_POSTGRES else "Database: Local SQLite • V63.15 B2B REVIEW + USER COUNT")
     st.markdown("## Control Tower")
     page = st.radio(
         "Navigation",
@@ -7766,6 +7880,7 @@ with st.sidebar:
             "Factory Stock Requirement",
             "Sales & Return 360°",
             "Customer SKU & Price Master",
+            "User Working Summary",
             "Upload Centre",
             "Audit / Exceptions",
         ],
@@ -8712,6 +8827,42 @@ elif page == "Customer SKU & Price Master":
             "Customer_ERP_Item_Price_Master.xlsx",
             "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
+
+# ---------------------------------------------------------
+# USER WORKING SUMMARY
+# ---------------------------------------------------------
+elif page == "User Working Summary":
+    st.subheader("User Working Summary")
+    st.caption("Unique Sales Orders | Unique Invoices | Sum of Invoice Gross Amount by User ID")
+
+    c1, c2 = st.columns([1,2])
+    with c1:
+        period_mode = st.radio("Period", ["Daily","Monthly"], horizontal=True)
+
+    if period_mode == "Daily":
+        with c2:
+            selected_work_date = st.date_input("Working Date", value=datetime.now().date())
+        summary = user_working_summary("Daily", selected_day=selected_work_date)
+    else:
+        with c2:
+            selected_work_month = st.text_input(
+                "Month (YYYY-MM)", value=datetime.now().strftime("%Y-%m")
+            ).strip()
+        summary = user_working_summary("Monthly", selected_month=selected_work_month)
+
+    if summary.empty:
+        st.info(
+            "No user-wise work found. Re-upload the Sales Order file and Sale Register once "
+            "after V63.15 so User ID is stored."
+        )
+    else:
+        k1,k2,k3 = st.columns(3)
+        k1.metric("Sales Orders", f"{int(summary['Sales Orders'].sum()):,}")
+        k2.metric("Invoices", f"{int(summary['Invoices'].sum()):,}")
+        k3.metric("Invoice Value", f"₹{float(summary['Invoice Value'].sum()):,.2f}")
+        show = summary.copy()
+        show["Invoice Value"] = show["Invoice Value"].map(lambda x: f"{x:,.2f}")
+        st.dataframe(show, width="stretch", hide_index=True)
 
 # ---------------------------------------------------------
 # UPLOAD CENTRE
