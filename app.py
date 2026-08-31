@@ -104,7 +104,7 @@ class PGCompatConnection:
         self._con = psycopg2.connect(
             DATABASE_URL,
             connect_timeout=20,
-            application_name="modern_trade_control_tower_v6315_cloud",
+            application_name="modern_trade_control_tower_v6316_cloud",
             keepalives=1,
             keepalives_idle=30,
             keepalives_interval=10,
@@ -1745,6 +1745,9 @@ def parse_customer_po_excel_by_mapping(raw, source_file, upload_id):
                 "Excel Row": row_no,
             })
 
+        stale_removed = cleanup_stale_po_lines(
+            con, ledger, po_no, [r.get("Customer Item") for r in parsed]
+        )
         con.commit()
     finally:
         con.close()
@@ -1757,6 +1760,7 @@ def parse_customer_po_excel_by_mapping(raw, source_file, upload_id):
         "profile": profile,
         "added": added,
         "updated": updated,
+        "stale_removed": stale_removed,
         "unmapped": unmapped,
         "skipped": skipped,
         "rows": pd.DataFrame(parsed),
@@ -1913,10 +1917,27 @@ def repair_pdf_po_header(profile, full_text, header):
     if "BLINK" in p:
         m = re.search(r"R\.O\.\s*Number\s*:\s*([0-9]+)", full_text, re.I)
         if m: h["PO No"] = m.group(1)
-        m = re.search(r"(?m)^Date\s*:\s*([A-Za-z.]+\s+\d{1,2},\s+\d{4})", full_text, re.I)
-        if m: h["PO Date"] = _header_date(m.group(1))
-        m = re.search(r"R\.O\.\s*expiry\s*date\s*:\s*([A-Za-z.]+\s+\d{1,2},\s+\d{4})", full_text, re.I|re.S)
-        if m: h["PO Expiry/DELIVERY DATE"] = _header_date(m.group(1))
+        m = re.search(
+            r"R\.O\.\s*Number\s*:\s*[0-9]+.*?\bDate\s*:\s*"
+            r"([A-Za-z]{3,9}\.?\s+\d{1,2},\s+\d{4})",
+            full_text, re.I | re.S
+        )
+        if not m:
+            m = re.search(
+                r"\bDate\s*:\s*([A-Za-z]{3,9}\.?\s+\d{1,2},\s+\d{4})",
+                full_text, re.I
+            )
+        if m:
+            h["PO Date"] = _header_date(m.group(1))
+
+        flat_text = re.sub(r"\s+", " ", full_text)
+        m = re.search(
+            r"R\.O\.\s*expiry\s*date\s*:\s*"
+            r"([A-Za-z]{3,9}\.?\s+\d{1,2},\s+\d{4})",
+            flat_text, re.I
+        )
+        if m:
+            h["PO Expiry/DELIVERY DATE"] = _header_date(m.group(1))
         m = re.search(r"Delivered\s+To\s*:\s*(.+?)(?=\s*GST\s+No\.\s*:)", full_text, re.I|re.S)
         if m: h["Ship to Location"] = _clean_po_address(m.group(1))
         m = re.search(r"Delivered\s+To\s*:.*?GST\s+No\.\s*:\s*([0-9A-Z]{15})", full_text, re.I|re.S)
@@ -1967,7 +1988,19 @@ def repair_pdf_po_header(profile, full_text, header):
         )
         if bill:
             g = re.search(r"GSTIN\s+No\s*:\s*([0-9A-Z]{15})", bill.group(1), re.I)
-            if g: h["Ship to GST no as per PO"] = g.group(1).upper()
+            if g:
+                h["Ship to GST no as per PO"] = g.group(1).upper()
+
+        if not extract_pin_from_text(h.get("Ship to Location","")):
+            name = re.search(
+                r"Name:\s*(CPWI\s+Pvt\.Ltd\.[−–-][A-Z]+\s*\d+)",
+                full_text, re.I
+            )
+            pin = re.search(r"(?<!\d)(110044|110092)(?!\d)", full_text)
+            if pin:
+                h["Ship to Location"] = _clean_po_address(
+                    f"{name.group(1) if name else 'CP Wholesale'} {pin.group(1)}"
+                )
 
     elif "METRO" in p:
         m = re.search(r"PO\s+NO\.\s*:\s*([0-9]+)", full_text, re.I)
@@ -2132,6 +2165,14 @@ def parse_customer_po_pdf_by_mapping(raw, source_file, upload_id):
             if not po_value and qty and unit_price:
                 po_value = qty * unit_price
 
+            profile_u = profile.upper()
+            if ("CP WHOLESALE" in profile_u or "LOTS" in profile_u) and unit_price:
+                unit_price = unit_price / 1.18
+            elif "FLIPKART" in profile_u and unit_price:
+                unit_price = unit_price / 1.18
+            elif "BI WORLDWIDE" in profile_u and po_value and qty:
+                unit_price = po_value / qty / 1.18
+
             action = upsert_po_line(
                 con,
                 source_file=source_file,
@@ -2171,6 +2212,9 @@ def parse_customer_po_pdf_by_mapping(raw, source_file, upload_id):
                 "PDF Table": selected_table,
             })
 
+        stale_removed = cleanup_stale_po_lines(
+            con, ledger, po_no, [r.get("Customer Item") for r in parsed]
+        )
         con.commit()
     finally:
         con.close()
@@ -2183,6 +2227,7 @@ def parse_customer_po_pdf_by_mapping(raw, source_file, upload_id):
         "profile": profile,
         "added": added,
         "updated": updated,
+        "stale_removed": stale_removed,
         "unmapped": unmapped,
         "rows": pd.DataFrame(parsed),
         "po_no": po_no,
@@ -2349,6 +2394,36 @@ def import_po_excel(df, source_file, upload_id):
     finally:
         con.close()
     return added, updated
+
+
+
+def cleanup_stale_po_lines(con, ledger, po_no, valid_customer_items):
+    """Delete stale PO lines after a complete PO has been successfully re-parsed."""
+    ledger = text_value(ledger).strip()
+    po_no = text_value(po_no).strip()
+    valid = {
+        canonical_customer_item(x)
+        for x in (valid_customer_items or [])
+        if canonical_customer_item(x)
+    }
+    if not ledger or not po_no or not valid:
+        return 0
+
+    existing = con.execute(
+        """SELECT id,customer_item_code
+           FROM po_lines
+           WHERE UPPER(TRIM(COALESCE(ledger_name,'')))=UPPER(TRIM(?))
+             AND UPPER(TRIM(COALESCE(po_no,'')))=UPPER(TRIM(?))""",
+        (ledger, po_no)
+    ).fetchall()
+
+    stale = [
+        r[0] for r in existing
+        if canonical_customer_item(r[1]) not in valid
+    ]
+    for row_id in stale:
+        con.execute("DELETE FROM po_lines WHERE id=?", (row_id,))
+    return len(stale)
 
 
 def upsert_po_line(
@@ -2741,11 +2816,18 @@ def reprocess_stored_customer_po_pdfs():
             errors.append(f"{u['file_name']}: stored PDF not found")
             continue
         try:
-            result = process_customer_po_pdf(
-                p.read_bytes(),
+            raw = p.read_bytes()
+            result = parse_customer_po_pdf_by_mapping(
+                raw,
                 text_value(u["file_name"]),
                 int(u["id"])
             )
+            if result is None:
+                result = process_customer_po_pdf(
+                    raw,
+                    text_value(u["file_name"]),
+                    int(u["id"])
+                )
             update_upload(int(u["id"]), "Processed", len(result["rows"]))
             processed += 1
             rows += len(result["rows"])
@@ -2800,11 +2882,17 @@ def import_flipkart_po_excel(raw, source_file, upload_id):
     )
     ws = wb[wb.sheetnames[0]]
 
-    po_no = _excel_cell_text(ws["B2"].value)
-    order_date_raw = ws["V2"].value
-    expiry_raw = ws["Q2"].value
-    ship_to_location = _excel_cell_text(ws["N5"].value)
-    ship_to_gst_no = _excel_cell_text(ws["U5"].value)
+    po_no = _excel_cell_text(ws["A3"].value)
+    mt_po = re.search(r"PURCHASE\s+ORDER\s+NO\s*-\s*([A-Z0-9]+)", po_no, re.I)
+    if mt_po:
+        po_no = mt_po.group(1)
+    if not po_no:
+        po_no = _excel_cell_text(ws["B2"].value)
+
+    order_date_raw = ws["P5"].value or ws["V2"].value
+    expiry_raw = ws["L5"].value or ws["Q2"].value
+    ship_to_location = _excel_cell_text(ws["T10"].value) or _excel_cell_text(ws["N5"].value)
+    ship_to_gst_no = _excel_cell_text(ws["Z10"].value) or _excel_cell_text(ws["U5"].value)
 
     if not po_no:
         raise ValueError("Flipkart PO No. not found in fixed cell B2.")
@@ -2827,10 +2915,12 @@ def import_flipkart_po_excel(raw, source_file, upload_id):
     con = open_db()
     try:
         blank_run = 0
-        for row_no in range(11, ws.max_row + 1):
+        valid_items = []
+        start_row = 18 if _excel_cell_text(ws["C18"].value) else 11
+        for row_no in range(start_row, ws.max_row + 1):
             customer_item = _excel_cell_text(ws[f"C{row_no}"].value)
             qty_raw = ws[f"D{row_no}"].value
-            value_raw = ws[f"W{row_no}"].value
+            value_raw = ws[f"AD{row_no}"].value if start_row == 18 else ws[f"W{row_no}"].value
 
             # Ignore formatting/total rows after the item section.
             if not customer_item:
@@ -2877,8 +2967,15 @@ def import_flipkart_po_excel(raw, source_file, upload_id):
             if not erp:
                 unmapped += 1
 
-            unit_price = (po_value / qty) if qty else number_value(master_price)
+            if start_row == 18:
+                supplier_unit = number_value(ws[f"R{row_no}"].value)
+                unit_price = supplier_unit / 1.18 if supplier_unit else (
+                    (po_value / qty / 1.18) if qty else number_value(master_price)
+                )
+            else:
+                unit_price = (po_value / qty / 1.18) if qty else number_value(master_price)
             description = master_desc or ""
+            valid_items.append(customer_item)
 
             action = upsert_po_line(
                 con,
@@ -2917,6 +3014,7 @@ def import_flipkart_po_excel(raw, source_file, upload_id):
                 "Excel Row": row_no,
             })
 
+        stale_removed = cleanup_stale_po_lines(con, ledger, po_no, valid_items)
         con.commit()
     finally:
         con.close()
@@ -2932,6 +3030,7 @@ def import_flipkart_po_excel(raw, source_file, upload_id):
         "updated": updated,
         "skipped": skipped,
         "unmapped": unmapped,
+        "stale_removed": stale_removed,
         "rows": pd.DataFrame(parsed_rows),
         "po_no": po_no,
     }
@@ -7870,7 +7969,7 @@ def user_working_summary(period_mode="Daily", selected_day=None, selected_month=
 # UI
 # =========================================================
 with st.sidebar:
-    st.caption("Database: Supabase PostgreSQL • V63.15 B2B REVIEW + USER COUNT" if USE_POSTGRES else "Database: Local SQLite • V63.15 B2B REVIEW + USER COUNT")
+    st.caption("Database: Supabase PostgreSQL • V63.16 PO REPROCESS REPAIR" if USE_POSTGRES else "Database: Local SQLite • V63.16 PO REPROCESS REPAIR")
     st.markdown("## Control Tower")
     page = st.radio(
         "Navigation",
