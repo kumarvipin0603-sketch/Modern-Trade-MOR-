@@ -104,7 +104,7 @@ class PGCompatConnection:
         self._con = psycopg2.connect(
             DATABASE_URL,
             connect_timeout=20,
-            application_name="modern_trade_control_tower_v6312_cloud",
+            application_name="modern_trade_control_tower_v6313_cloud",
             keepalives=1,
             keepalives_idle=30,
             keepalives_interval=10,
@@ -7756,7 +7756,7 @@ def b2b_order_staging_excel_bytes(df):
 # UI
 # =========================================================
 with st.sidebar:
-    st.caption("Database: Supabase PostgreSQL • V63.12 PO FULL ENRICHMENT FIX" if USE_POSTGRES else "Database: Local SQLite • V63.12 PO FULL ENRICHMENT FIX")
+    st.caption("Database: Supabase PostgreSQL • V63.13 B2B SEARCH FILTER" if USE_POSTGRES else "Database: Local SQLite • V63.13 B2B SEARCH FILTER")
     st.markdown("## Control Tower")
     page = st.radio(
         "Navigation",
@@ -8288,13 +8288,47 @@ elif page == "B2B Order Staging":
 
     staging = build_b2b_order_staging()
 
+    # V63.13 - Global PO search controls B2B Order Staging as well.
+    # If Track Any PO Number is blank -> show all staged PO lines.
+    # If one/multiple PO numbers were searched -> show only those POs.
+    tracked_po_text = text_value(st.session_state.get("track_po", "")).strip()
+    tracked_pos = [
+        p.strip().upper()
+        for p in re.split(r"[,;\n]+", tracked_po_text)
+        if p.strip()
+    ]
+
+    staging_scope = staging.copy()
+    if tracked_pos and not staging_scope.empty:
+        po_col = next(
+            (c for c in [
+                "PO No.", "PO No", "Po Number", "PO Number",
+                "Customer PO Number", "PO"
+            ] if c in staging_scope.columns),
+            None
+        )
+        if po_col:
+            staging_scope = staging_scope[
+                staging_scope[po_col]
+                .fillna("")
+                .astype(str)
+                .str.strip()
+                .str.upper()
+                .isin(set(tracked_pos))
+            ].copy()
+        else:
+            staging_scope = staging_scope.iloc[0:0].copy()
+
     with b2b_c2:
-        st.metric("Uploaded PO Lines", f"{len(staging):,}")
+        metric_label = "Searched PO Lines" if tracked_pos else "Uploaded PO Lines"
+        st.metric(metric_label, f"{len(staging_scope):,}")
 
     with b2b_c3:
-        if not staging.empty:
-            ready_count = int(staging["Status"].eq("Ready").sum())
-            pending_count = len(staging) - ready_count
+        if tracked_pos:
+            st.caption("Showing only searched PO(s): " + ", ".join(tracked_pos))
+        elif not staging_scope.empty:
+            ready_count = int(staging_scope["Status"].eq("Ready").sum())
+            pending_count = len(staging_scope) - ready_count
             st.caption(
                 f"Ready for staging: {ready_count:,} | Mapping pending: {pending_count:,}"
             )
@@ -8303,6 +8337,11 @@ elif page == "B2B Order Staging":
 
     if staging.empty:
         st.info("No Customer PO lines available. Upload/reprocess Customer POs first.")
+    elif tracked_pos and staging_scope.empty:
+        st.warning(
+            "No B2B Order Staging lines found for the searched PO(s): "
+            + ", ".join(tracked_pos)
+        )
     else:
         f1,f2 = st.columns([1.2,4])
         with f1:
@@ -8311,7 +8350,7 @@ elif page == "B2B Order Staging":
                 ["All","Ready","Mapping Pending"],
                 key="b2b_staging_view"
             )
-        show = staging.copy()
+        show = staging_scope.copy()
         if staging_view == "Ready":
             show = show[show["Status"]=="Ready"].copy()
         elif staging_view == "Mapping Pending":
@@ -8324,9 +8363,10 @@ elif page == "B2B Order Staging":
             height=min(650, 70 + min(len(show), 18)*34)
         )
 
+        # Download follows the same global PO-search scope.
         st.download_button(
             "Download B2B Order Staging",
-            b2b_order_staging_excel_bytes(staging),
+            b2b_order_staging_excel_bytes(staging_scope),
             f"B2B_Dealer_Order_Staging_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
             "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             width="stretch"
