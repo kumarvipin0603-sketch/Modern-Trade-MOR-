@@ -104,7 +104,7 @@ class PGCompatConnection:
         self._con = psycopg2.connect(
             DATABASE_URL,
             connect_timeout=20,
-            application_name="modern_trade_control_tower_v6316_cloud",
+            application_name="modern_trade_control_tower_v6318_cloud",
             keepalives=1,
             keepalives_idle=30,
             keepalives_interval=10,
@@ -1702,7 +1702,8 @@ def parse_customer_po_excel_by_mapping(raw, source_file, upload_id):
 
             profile_u = profile.upper()
             if ("CP WHOLESALE" in profile_u or "LOTS" in profile_u) and unit_price:
-                unit_price = unit_price / 1.18
+                # Use PO Unit Cost Exc. Tax (INR) exactly as printed.
+                unit_price = unit_price
             elif "FLIPKART" in profile_u and unit_price:
                 unit_price = unit_price / 1.18
             elif "BI WORLDWIDE" in profile_u and po_value and qty:
@@ -2122,7 +2123,10 @@ def parse_customer_po_pdf_by_mapping(raw, source_file, upload_id):
 
                 if "BLINK" in profile.upper() and len(row) >= 13:
                     values["PO Qty"] = number_value(row[10])
-                    values["PO Unit Price"] = number_value(row[11])
+                    landing_rate = number_value(row[9])
+                    values["PO Unit Price"] = (
+                        landing_rate / 1.18 if landing_rate else 0
+                    )
                     values["PO Value"] = number_value(row[12])
 
                 customer_item = canonical_customer_item(values.get("Customer Item Code"))
@@ -2167,7 +2171,8 @@ def parse_customer_po_pdf_by_mapping(raw, source_file, upload_id):
 
             profile_u = profile.upper()
             if ("CP WHOLESALE" in profile_u or "LOTS" in profile_u) and unit_price:
-                unit_price = unit_price / 1.18
+                # Use PO Unit Cost Exc. Tax (INR) exactly as printed.
+                unit_price = unit_price
             elif "FLIPKART" in profile_u and unit_price:
                 unit_price = unit_price / 1.18
             elif "BI WORLDWIDE" in profile_u and po_value and qty:
@@ -7861,7 +7866,9 @@ def build_b2b_order_staging():
         qty_b2b = number_value(r.get("po_qty"))
         price_b2b = number_value(r.get("po_unit_price"))
         if "BLINK" in ledger.upper() and qty_b2b > 500 and 0 < price_b2b <= 500:
-            qty_b2b, price_b2b = price_b2b, qty_b2b
+            # Legacy reversed rows require PO reprocessing under V63.17.
+            # Do not substitute MRP as Unit Price here.
+            qty_b2b = price_b2b
 
         missing = []
         if not customer_no:
@@ -7969,7 +7976,7 @@ def user_working_summary(period_mode="Daily", selected_day=None, selected_month=
 # UI
 # =========================================================
 with st.sidebar:
-    st.caption("Database: Supabase PostgreSQL • V63.16 PO REPROCESS REPAIR" if USE_POSTGRES else "Database: Local SQLite • V63.16 PO REPROCESS REPAIR")
+    st.caption("Database: Supabase PostgreSQL • V63.18 CP UNIT COST DIRECT" if USE_POSTGRES else "Database: Local SQLite • V63.18 CP UNIT COST DIRECT")
     st.markdown("## Control Tower")
     page = st.radio(
         "Navigation",
