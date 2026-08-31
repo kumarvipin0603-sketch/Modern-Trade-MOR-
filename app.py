@@ -104,7 +104,7 @@ class PGCompatConnection:
         self._con = psycopg2.connect(
             DATABASE_URL,
             connect_timeout=20,
-            application_name="modern_trade_control_tower_v6313_cloud",
+            application_name="modern_trade_control_tower_v6314_cloud",
             keepalives=1,
             keepalives_idle=30,
             keepalives_interval=10,
@@ -7756,7 +7756,7 @@ def b2b_order_staging_excel_bytes(df):
 # UI
 # =========================================================
 with st.sidebar:
-    st.caption("Database: Supabase PostgreSQL • V63.13 B2B SEARCH FILTER" if USE_POSTGRES else "Database: Local SQLite • V63.13 B2B SEARCH FILTER")
+    st.caption("Database: Supabase PostgreSQL • V63.14 B2B SEARCH COLUMN FIX" if USE_POSTGRES else "Database: Local SQLite • V63.14 B2B SEARCH COLUMN FIX")
     st.markdown("## Control Tower")
     page = st.radio(
         "Navigation",
@@ -8300,21 +8300,36 @@ elif page == "B2B Order Staging":
 
     staging_scope = staging.copy()
     if tracked_pos and not staging_scope.empty:
+        # build_b2b_order_staging() outputs the PO field as "Customer PO No.".
+        # Keep aliases for future layout changes, but prefer the exact staging
+        # column first.
         po_col = next(
             (c for c in [
-                "PO No.", "PO No", "Po Number", "PO Number",
-                "Customer PO Number", "PO"
+                "Customer PO No.",
+                "Customer PO Number",
+                "Customer PO No",
+                "PO No.",
+                "PO No",
+                "Po Number",
+                "PO Number",
+                "PO",
             ] if c in staging_scope.columns),
             None
         )
+
         if po_col:
+            # Use the same canonical PO identity as Main Reconciliation.
+            # This safely handles spaces, hyphens, apostrophes, Excel numeric
+            # formatting and case differences.
+            wanted_po_keys = {
+                canonical_po_number(p)
+                for p in tracked_pos
+                if canonical_po_number(p)
+            }
             staging_scope = staging_scope[
                 staging_scope[po_col]
-                .fillna("")
-                .astype(str)
-                .str.strip()
-                .str.upper()
-                .isin(set(tracked_pos))
+                .map(canonical_po_number)
+                .isin(wanted_po_keys)
             ].copy()
         else:
             staging_scope = staging_scope.iloc[0:0].copy()
@@ -8325,7 +8340,20 @@ elif page == "B2B Order Staging":
 
     with b2b_c3:
         if tracked_pos:
-            st.caption("Showing only searched PO(s): " + ", ".join(tracked_pos))
+            matched_po_count = 0
+            if not staging_scope.empty:
+                _pc = next(
+                    (c for c in ["Customer PO No.","Customer PO Number","Customer PO No","PO No.","PO No","Po Number","PO Number","PO"]
+                     if c in staging_scope.columns),
+                    None
+                )
+                if _pc:
+                    matched_po_count = staging_scope[_pc].map(canonical_po_number).nunique()
+            st.caption(
+                "Showing only searched PO(s): "
+                + ", ".join(tracked_pos)
+                + f" | Matched PO(s): {matched_po_count}"
+            )
         elif not staging_scope.empty:
             ready_count = int(staging_scope["Status"].eq("Ready").sum())
             pending_count = len(staging_scope) - ready_count
