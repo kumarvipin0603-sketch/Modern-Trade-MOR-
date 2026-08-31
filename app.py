@@ -104,7 +104,7 @@ class PGCompatConnection:
         self._con = psycopg2.connect(
             DATABASE_URL,
             connect_timeout=20,
-            application_name="modern_trade_control_tower_v6318_cloud",
+            application_name="modern_trade_control_tower_v6319_cloud",
             keepalives=1,
             keepalives_idle=30,
             keepalives_interval=10,
@@ -1576,12 +1576,119 @@ def _mapping_value(raw_value, value_type="Text", extract_regex=""):
     return text_value(val)
 
 
+
+class _CompatCell:
+    def __init__(self, value):
+        self.value = value
+
+
+def _excel_col_to_index(col_letters):
+    n = 0
+    for ch in str(col_letters).upper():
+        if "A" <= ch <= "Z":
+            n = n * 26 + (ord(ch) - 64)
+    return n - 1
+
+
+class _CompatSheet:
+    """Small worksheet adapter for legacy .xls files read through calamine."""
+    def __init__(self, df):
+        self._df = df
+        self.max_row = len(df.index)
+        self.max_column = len(df.columns)
+
+    def __getitem__(self, ref):
+        m = re.fullmatch(r"([A-Za-z]+)(\d+)", str(ref).strip())
+        if not m:
+            raise KeyError(ref)
+        c = _excel_col_to_index(m.group(1))
+        r = int(m.group(2)) - 1
+        value = None
+        if 0 <= r < self.max_row and 0 <= c < self.max_column:
+            value = self._df.iat[r, c]
+            if pd.isna(value):
+                value = None
+        return _CompatCell(value)
+
+    def iter_rows(
+        self,
+        min_row=1,
+        max_row=None,
+        min_col=1,
+        max_col=None,
+        values_only=False,
+    ):
+        max_row = min(max_row or self.max_row, self.max_row)
+        max_col = min(max_col or self.max_column, self.max_column)
+        for r in range(max(1, min_row) - 1, max_row):
+            vals = []
+            for c in range(max(1, min_col) - 1, max_col):
+                value = self._df.iat[r, c]
+                if pd.isna(value):
+                    value = None
+                vals.append(value if values_only else _CompatCell(value))
+            yield tuple(vals)
+
+
+class _CompatWorkbook:
+    def __init__(self, sheets):
+        self._sheets = sheets
+        self.sheetnames = list(sheets.keys())
+
+    def __getitem__(self, name):
+        return self._sheets[name]
+
+
+def load_excel_workbook_compat(raw):
+    """
+    Load both true .xlsx and legacy/mislabelled .xls Flipkart exports.
+
+    openpyxl only supports ZIP-based XLSX. Some marketplace exports are BIFF
+    .xls files (or have an .xls extension), which previously raised:
+        File is not a zip file
+
+    Fallback uses pandas + python-calamine, already included in requirements.
+    It is wrapped in a worksheet-compatible adapter so existing cell mapping
+    code (A3, P5, C18, etc.) continues to work unchanged.
+    """
+    try:
+        return openpyxl.load_workbook(
+            io.BytesIO(raw),
+            data_only=True,
+            read_only=True
+        )
+    except (zipfile.BadZipFile, KeyError, ValueError, OSError):
+        pass
+
+    try:
+        xls = pd.ExcelFile(io.BytesIO(raw), engine="calamine")
+        sheets = {}
+        for sh in xls.sheet_names:
+            df = pd.read_excel(
+                io.BytesIO(raw),
+                sheet_name=sh,
+                header=None,
+                dtype=object,
+                engine="calamine",
+            )
+            sheets[str(sh)] = _CompatSheet(df)
+        if not sheets:
+            raise ValueError("Excel workbook contains no readable sheets.")
+        return _CompatWorkbook(sheets)
+    except Exception as e:
+        raise ValueError(
+            "Unable to read this Excel PO. The file may be damaged or may not "
+            "be a valid XLS/XLSX workbook. Please download the PO again from "
+            f"the source portal. Technical detail: {e}"
+        ) from e
+
+
 def detect_excel_po_profile(raw):
     mappings = active_po_mappings("EXCEL")
     if mappings.empty:
         return "", pd.DataFrame()
 
-    wb = openpyxl.load_workbook(io.BytesIO(raw), data_only=True, read_only=True)
+    wb = load_excel_workbook_compat(raw)
     for profile, g in mappings.groupby("profile_name", sort=False):
         first = g.iloc[0]
         sheet_name = text_value(first.get("sheet_name"))
@@ -1616,7 +1723,7 @@ def parse_customer_po_excel_by_mapping(raw, source_file, upload_id):
         return None
 
     first = mappings.iloc[0]
-    wb = openpyxl.load_workbook(io.BytesIO(raw), data_only=True, read_only=True)
+    wb = load_excel_workbook_compat(raw)
     sheet_name = text_value(first.get("sheet_name"))
     ws = wb[sheet_name] if sheet_name and sheet_name in wb.sheetnames else wb[wb.sheetnames[0]]
 
@@ -2860,7 +2967,7 @@ def _excel_cell_text(value):
 
 def import_flipkart_po_excel(raw, source_file, upload_id):
     """
-    FLIPKART INDIA CUSTOMER PO — LOCKED CELL MAPPING
+    FLIPKART INDIA CUSTOMER PO — XLS/XLSX COMPATIBLE LOCKED CELL MAPPING
 
     Header / PO-level fields:
       B2  = PO No.
@@ -2880,11 +2987,7 @@ def import_flipkart_po_excel(raw, source_file, upload_id):
     PO Date is intentionally NOT guessed because a fixed Flipkart PO Date cell
     has not yet been confirmed.
     """
-    wb = openpyxl.load_workbook(
-        io.BytesIO(raw),
-        data_only=True,
-        read_only=True
-    )
+    wb = load_excel_workbook_compat(raw)
     ws = wb[wb.sheetnames[0]]
 
     po_no = _excel_cell_text(ws["A3"].value)
@@ -4135,7 +4238,7 @@ def detect_excel_grn_profile(raw):
     if mappings.empty:
         return "", pd.DataFrame()
 
-    wb = openpyxl.load_workbook(io.BytesIO(raw), data_only=True, read_only=True)
+    wb = load_excel_workbook_compat(raw)
     for profile, g in mappings.groupby("profile_name", sort=False):
         first = g.iloc[0]
         sheet_name = text_value(first.get("sheet_name"))
@@ -4311,7 +4414,7 @@ def parse_grn_excel_by_mapping(raw):
         return None
 
     first = mappings.iloc[0]
-    wb = openpyxl.load_workbook(io.BytesIO(raw), data_only=True, read_only=True)
+    wb = load_excel_workbook_compat(raw)
     sheet_name = text_value(first.get("sheet_name"))
     ws = wb[sheet_name] if sheet_name and sheet_name in wb.sheetnames else wb[wb.sheetnames[0]]
 
@@ -7976,7 +8079,7 @@ def user_working_summary(period_mode="Daily", selected_day=None, selected_month=
 # UI
 # =========================================================
 with st.sidebar:
-    st.caption("Database: Supabase PostgreSQL • V63.18 CP UNIT COST DIRECT" if USE_POSTGRES else "Database: Local SQLite • V63.18 CP UNIT COST DIRECT")
+    st.caption("Database: Supabase PostgreSQL • V63.19 FLIPKART XLS COMPAT" if USE_POSTGRES else "Database: Local SQLite • V63.19 FLIPKART XLS COMPAT")
     st.markdown("## Control Tower")
     page = st.radio(
         "Navigation",
