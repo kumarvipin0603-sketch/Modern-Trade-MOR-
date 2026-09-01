@@ -104,7 +104,7 @@ class PGCompatConnection:
         self._con = psycopg2.connect(
             DATABASE_URL,
             connect_timeout=20,
-            application_name="modern_trade_control_tower_v6321_cloud",
+            application_name="modern_trade_control_tower_v6322_cloud",
             keepalives=1,
             keepalives_idle=30,
             keepalives_interval=10,
@@ -7493,9 +7493,10 @@ def live_po_source():
     live_erp = []
     live_desc = []
     live_customer_no = []
+    live_master_price = []
 
     for _, r in po.iterrows():
-        erp, desc, _price, customer_no = _fast_resolve_customer_item(
+        erp, desc, master_price, customer_no = _fast_resolve_customer_item(
             r.get("ledger_name"),
             r.get("customer_item_code"),
             maps
@@ -7506,10 +7507,12 @@ def live_po_source():
         live_erp.append(final_erp)
         live_desc.append(final_desc)
         live_customer_no.append(text_value(customer_no))
+        live_master_price.append(number_value(master_price))
 
     po["erp_item_code"] = live_erp
     po["item_description"] = live_desc
     po["_master_customer_no"] = live_customer_no
+    po["_master_price"] = live_master_price
     po["erp_item_code_k"] = (
         po["erp_item_code"].fillna("").astype(str).str.strip().str.upper()
     )
@@ -7938,8 +7941,9 @@ def factory_branch_options():
 # =========================================================
 B2B_STAGING_COLUMNS = [
     "ID","Customer No.","Ship","Customer PO No.","Customer PO Date",
-    "Posting Date","Item No.","Quantity","Unit Price","Status",
-    "Sales Order No.","So Created","PO Expiry Date"
+    "Posting Date","Item No.","Quantity","Unit Price",
+    "Master Price","Price Difference","Price Check",
+    "Status","Sales Order No.","So Created","PO Expiry Date"
 ]
 
 
@@ -8024,10 +8028,21 @@ def build_b2b_order_staging():
 
         qty_b2b = number_value(r.get("po_qty"))
         price_b2b = number_value(r.get("po_unit_price"))
+        master_price_b2b = number_value(r.get("_master_price"))
         if "BLINK" in ledger.upper() and qty_b2b > 500 and 0 < price_b2b <= 500:
             # Legacy reversed rows require PO reprocessing under V63.17.
             # Do not substitute MRP as Unit Price here.
             qty_b2b = price_b2b
+
+        if price_b2b > 0 and master_price_b2b > 0:
+            price_diff = round(price_b2b - master_price_b2b, 2)
+            price_check = "⚠ PRICE MISMATCH" if abs(price_diff) > 0.01 else "MATCH"
+        elif master_price_b2b <= 0:
+            price_diff = 0.0
+            price_check = "MASTER PRICE MISSING"
+        else:
+            price_diff = 0.0
+            price_check = "PO PRICE MISSING"
 
         missing = []
         if not customer_no:
@@ -8047,6 +8062,9 @@ def build_b2b_order_staging():
             "Item No.": erp_item,
             "Quantity": qty_b2b,
             "Unit Price": price_b2b,
+            "Master Price": master_price_b2b,
+            "Price Difference": price_diff,
+            "Price Check": price_check,
             "Status": "Ready" if not missing else "Mapping Pending: " + ", ".join(missing),
             "Sales Order No.": so_no,
             "So Created": 1 if so_no else 0,
@@ -8066,7 +8084,7 @@ def b2b_order_staging_excel_bytes(df):
 
         widths = {
             "A":10,"B":16,"C":15,"D":22,"E":18,"F":16,"G":18,
-            "H":12,"I":14,"J":30,"K":20,"L":12,"M":18
+            "H":12,"I":14,"J":14,"K":16,"L":22,"M":30,"N":20,"O":12,"P":18
         }
         for col,width in widths.items():
             ws.column_dimensions[col].width = width
@@ -8135,7 +8153,7 @@ def user_working_summary(period_mode="Daily", selected_day=None, selected_month=
 # UI
 # =========================================================
 with st.sidebar:
-    st.caption("Database: Supabase PostgreSQL • V63.21 ROWS LOADED COUNT" if USE_POSTGRES else "Database: Local SQLite • V63.21 ROWS LOADED COUNT")
+    st.caption("Database: Supabase PostgreSQL • V63.22 PRICE MISMATCH ALERT" if USE_POSTGRES else "Database: Local SQLite • V63.22 PRICE MISMATCH ALERT")
     st.markdown("## Control Tower")
     page = st.radio(
         "Navigation",
@@ -8718,6 +8736,14 @@ elif page == "B2B Order Staging":
         metric_label = "Searched PO Lines" if tracked_pos else "Uploaded PO Lines"
         st.metric(metric_label, f"{len(staging_scope):,}")
 
+    mismatch_count = 0
+    if not staging_scope.empty and "Price Check" in staging_scope.columns:
+        mismatch_count = int(
+            staging_scope["Price Check"].fillna("").astype(str)
+            .str.contains("PRICE MISMATCH", regex=False)
+            .sum()
+        )
+
     with b2b_c3:
         if tracked_pos:
             matched_po_count = 0
@@ -8743,6 +8769,13 @@ elif page == "B2B Order Staging":
         else:
             st.caption("No Customer PO lines are currently uploaded.")
 
+    if mismatch_count > 0:
+        st.warning(
+            f"Price Review Required: {mismatch_count} B2B line(s) have a different "
+            "PO price versus Customer SKU & Price Master. The B2B Unit Price remains "
+            "the PO-derived price until your team reviews and corrects the relevant source."
+        )
+
     if staging.empty:
         st.info("No Customer PO lines available. Upload/reprocess Customer POs first.")
     elif tracked_pos and staging_scope.empty:
@@ -8755,7 +8788,7 @@ elif page == "B2B Order Staging":
         with f1:
             staging_view = st.selectbox(
                 "View",
-                ["All","Ready","Mapping Pending"],
+                ["All","Ready","Mapping Pending","Price Mismatch"],
                 key="b2b_staging_view"
             )
         show = staging_scope.copy()
@@ -8763,6 +8796,11 @@ elif page == "B2B Order Staging":
             show = show[show["Status"]=="Ready"].copy()
         elif staging_view == "Mapping Pending":
             show = show[show["Status"]!="Ready"].copy()
+        elif staging_view == "Price Mismatch":
+            show = show[
+                show["Price Check"].fillna("").astype(str)
+                .str.contains("PRICE MISMATCH", regex=False)
+            ].copy()
 
         st.dataframe(
             show,
