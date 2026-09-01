@@ -104,7 +104,7 @@ class PGCompatConnection:
         self._con = psycopg2.connect(
             DATABASE_URL,
             connect_timeout=20,
-            application_name="modern_trade_control_tower_v6319_cloud",
+            application_name="modern_trade_control_tower_v6321_cloud",
             keepalives=1,
             keepalives_idle=30,
             keepalives_interval=10,
@@ -1937,6 +1937,51 @@ def _pdf_row_values_from_mapping(row, line_maps):
     return values
 
 
+
+def _metro_ea_qty_and_unit_price(row):
+    """
+    Metro PO rule:
+    - Quantity may contain two values, e.g. 4.000 / 48.000
+    - UOM may contain matching values, e.g. C12 / EA
+    - B2B Quantity must use the quantity aligned to EA.
+    - B2B Unit Price = Total Base Value / EA Quantity.
+
+    Example:
+        Qty cell: 4.000\\n48.000
+        UOM cell: C12\\nEA
+        Total Base Value: 23,510.40
+        => Qty = 48
+        => Unit Price = 23,510.40 / 48 = 489.80
+    """
+    if not row or len(row) < 11:
+        return 0.0, 0.0, 0.0
+
+    qty_tokens = [
+        number_value(x)
+        for x in re.findall(r"\d[\d,]*(?:\.\d+)?", text_value(row[4]))
+    ]
+    uom_tokens = [
+        x.strip().upper()
+        for x in re.split(r"[\r\n]+", text_value(row[5]))
+        if x.strip()
+    ]
+
+    ea_qty = 0.0
+    if uom_tokens:
+        for i, uom in enumerate(uom_tokens):
+            if uom == "EA" and i < len(qty_tokens):
+                ea_qty = qty_tokens[i]
+                break
+
+    # If the line has only one quantity and UOM EA, use it directly.
+    if not ea_qty and len(qty_tokens) == 1 and "EA" in uom_tokens:
+        ea_qty = qty_tokens[0]
+
+    total_base_value = number_value(row[10])
+    unit_price = (total_base_value / ea_qty) if ea_qty else 0.0
+    return ea_qty, unit_price, total_base_value
+
+
 def _score_pdf_table_for_po(table, line_maps, start_idx=0):
     """
     Score a candidate PDF table by how many usable PO rows it produces.
@@ -2235,6 +2280,17 @@ def parse_customer_po_pdf_by_mapping(raw, source_file, upload_id):
                         landing_rate / 1.18 if landing_rate else 0
                     )
                     values["PO Value"] = number_value(row[12])
+
+                if "METRO" in profile.upper() and len(row) >= 11:
+                    ea_qty, ea_unit_price, total_base_value = _metro_ea_qty_and_unit_price(row)
+                    values["PO Qty"] = ea_qty
+                    values["PO Unit Price"] = ea_unit_price
+                    values["PO Value"] = total_base_value
+
+                if "METRO" in profile.upper() and len(row) > 1:
+                    article_match = re.search(r"^\s*([A-Z0-9]+)", text_value(row[1]), re.I)
+                    if article_match:
+                        values["Customer Item Code"] = article_match.group(1)
 
                 customer_item = canonical_customer_item(values.get("Customer Item Code"))
                 qty = number_value(values.get("PO Qty"))
@@ -8079,7 +8135,7 @@ def user_working_summary(period_mode="Daily", selected_day=None, selected_month=
 # UI
 # =========================================================
 with st.sidebar:
-    st.caption("Database: Supabase PostgreSQL • V63.19 FLIPKART XLS COMPAT" if USE_POSTGRES else "Database: Local SQLite • V63.19 FLIPKART XLS COMPAT")
+    st.caption("Database: Supabase PostgreSQL • V63.21 ROWS LOADED COUNT" if USE_POSTGRES else "Database: Local SQLite • V63.21 ROWS LOADED COUNT")
     st.markdown("## Control Tower")
     page = st.radio(
         "Navigation",
@@ -9578,7 +9634,7 @@ elif page == "Upload Centre":
                         update_upload(
                             uid,
                             f"Processed - Customer PO incremental merge | Added {result['added']} | Updated {result['updated']}",
-                            int(result["added"])
+                            int(result["added"]) + int(result["updated"])
                         )
                         st.success(
                             f"{f.name}: {result.get('profile','Customer PDF')} | "
@@ -9604,7 +9660,7 @@ elif page == "Upload Centre":
                             update_upload(
                                 uid,
                                 f"Processed - PO Mapping Master: {result['profile']} | Added {result['added']} | Updated {result['updated']}",
-                                int(result["added"])
+                                int(result["added"]) + int(result["updated"])
                             )
                             st.success(
                                 f"{f.name}: Mapping Profile '{result['profile']}' | "
