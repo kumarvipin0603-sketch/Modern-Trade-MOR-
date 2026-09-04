@@ -30,6 +30,23 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+# The grid's native magnifier only highlights matches; it does not remove
+# unrelated rows. Hide it to avoid confusion with our true server-side filters.
+st.markdown(
+    """
+    <style>
+    [data-testid="stElementToolbar"] button[aria-label="Search"],
+    [data-testid="stElementToolbar"] button[title="Search"],
+    [data-testid="stElementToolbarButton"][aria-label="Search"],
+    [data-testid="stElementToolbarButton"][title="Search"] {
+        display: none !important;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+
 warnings.filterwarnings(
     "ignore",
     message=r"Cell .* is marked as a date but the serial value .* is outside the limits for dates.*",
@@ -8299,7 +8316,7 @@ def user_working_summary(period_mode="Daily", selected_day=None, selected_month=
 # UI
 # =========================================================
 with st.sidebar:
-    st.caption("Database: Supabase PostgreSQL • V63.26 ZEPTO SHIP-TO PARSER FIX" if USE_POSTGRES else "Database: Local SQLite • V63.26 ZEPTO SHIP-TO PARSER FIX")
+    st.caption("Database: Supabase PostgreSQL • V63.27 TRUE ROW FILTER" if USE_POSTGRES else "Database: Local SQLite • V63.27 TRUE ROW FILTER")
     st.markdown("## Control Tower")
     page = st.radio(
         "Navigation",
@@ -9288,9 +9305,10 @@ elif page == "Customer SKU & Price Master":
     )
 
     master_search = st.text_input(
-        "Search SKU / Price Master",
-        placeholder="Search ledger, customer item code, ERP item code, description, EAN, price...",
-        key="sku_price_master_search"
+        "Filter SKU / Price Master Rows",
+        placeholder="Type anything — only matching row(s) will remain visible",
+        key="sku_price_master_search",
+        help="This is a true row filter. Unlike the grid's built-in magnifier, non-matching rows are removed from the table view."
     ).strip()
 
     master_view = master.copy()
@@ -9307,10 +9325,16 @@ elif page == "Customer SKU & Price Master":
             row_mask &= term_mask
         master_view = master_view.loc[row_mask].copy()
 
-    st.caption(
-        f"Showing {len(master_view):,} of {len(master):,} master row(s). "
-        "Only the Price column is editable below."
-    )
+    if master_search:
+        st.caption(
+            f"Filtered result: {len(master_view):,} matching row(s) out of {len(master):,}. "
+            "Only matching rows are displayed. Price can be edited directly."
+        )
+    else:
+        st.caption(
+            f"Showing all {len(master):,} master row(s). "
+            "Use the filter above to display only matching rows. Only the Price column is editable."
+        )
 
     if master_view.empty:
         st.info("No matching master rows found.")
