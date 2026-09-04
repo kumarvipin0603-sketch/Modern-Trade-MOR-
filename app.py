@@ -8157,8 +8157,12 @@ def build_b2b_order_staging():
         so_no = so_by_po.get(po_key, "")
 
         qty_b2b = number_value(r.get("po_qty"))
-        price_b2b = number_value(r.get("po_unit_price"))
-        master_price_b2b = number_value(r.get("_master_price"))
+
+        # B2B commercial prices must remain at 2-decimal precision.
+        # Do NOT convert/round them to a whole rupee because even ₹0.01/₹0.02
+        # per unit changes the extended value when quantity is multiplied.
+        price_b2b = round(number_value(r.get("po_unit_price")), 2)
+        master_price_b2b = round(number_value(r.get("_master_price")), 2)
 
         if "BLINK" in ledger.upper():
             # Repair legacy/corrupted Blinkit rows already stored in po_lines.
@@ -8193,7 +8197,7 @@ def build_b2b_order_staging():
             )
 
             if price_is_corrupt:
-                price_b2b = master_price_b2b
+                price_b2b = round(master_price_b2b, 2)
             if qty_is_corrupt and derived_qty > 0:
                 qty_b2b = derived_qty
 
@@ -8224,9 +8228,9 @@ def build_b2b_order_staging():
             "Posting Date": posting_date,
             "Item No.": erp_item,
             "Quantity": qty_b2b,
-            "Unit Price": price_b2b,
-            "Master Price": master_price_b2b,
-            "Price Difference": price_diff,
+            "Unit Price": round(price_b2b, 2),
+            "Master Price": round(master_price_b2b, 2),
+            "Price Difference": round(price_diff, 2),
             "Price Check": price_check,
             "Status": "Ready" if not missing else "Mapping Pending: " + ", ".join(missing),
             "Sales Order No.": so_no,
@@ -8243,6 +8247,14 @@ def b2b_order_staging_excel_bytes(df):
     with pd.ExcelWriter(out, engine="openpyxl") as writer:
         df.to_excel(writer, index=False, sheet_name="B2B Dealer Order Staging")
         ws = writer.book["B2B Dealer Order Staging"]
+
+        # Preserve B2B prices to exactly 2 decimal places in the staging export.
+        header_map = {cell.value: cell.column for cell in ws[1]}
+        for col_name in ("Unit Price", "Master Price", "Price Difference"):
+            col_idx = header_map.get(col_name)
+            if col_idx:
+                for row_idx in range(2, ws.max_row + 1):
+                    ws.cell(row=row_idx, column=col_idx).number_format = "0.00"
         ws.freeze_panes = "A2"
 
         widths = {
@@ -8316,7 +8328,7 @@ def user_working_summary(period_mode="Daily", selected_day=None, selected_month=
 # UI
 # =========================================================
 with st.sidebar:
-    st.caption("Database: Supabase PostgreSQL • V63.27 TRUE ROW FILTER" if USE_POSTGRES else "Database: Local SQLite • V63.27 TRUE ROW FILTER")
+    st.caption("Database: Supabase PostgreSQL • V63.28 B2B 2-DECIMAL PRICE" if USE_POSTGRES else "Database: Local SQLite • V63.28 B2B 2-DECIMAL PRICE")
     st.markdown("## Control Tower")
     page = st.radio(
         "Navigation",
@@ -8991,7 +9003,21 @@ elif page == "B2B Order Staging":
             show,
             width="stretch",
             hide_index=True,
-            height=min(650, 70 + min(len(show), 18)*34)
+            height=min(650, 70 + min(len(show), 18)*34),
+            column_config={
+                "Unit Price": st.column_config.NumberColumn(
+                    "Unit Price",
+                    format="%.2f"
+                ),
+                "Master Price": st.column_config.NumberColumn(
+                    "Master Price",
+                    format="%.2f"
+                ),
+                "Price Difference": st.column_config.NumberColumn(
+                    "Price Difference",
+                    format="%.2f"
+                ),
+            }
         )
 
         # Download follows the same global PO-search scope.
