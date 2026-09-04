@@ -3243,12 +3243,32 @@ def is_flipkart_fixed_cell_po(raw):
 # SHIP-TO LOCATION MASTER
 # =========================================================
 def canonical_ledger_name(value):
-    """Normalize ledger name only for matching; displayed text is unchanged."""
+    """
+    Normalize ledger name only for matching; displayed text is unchanged.
+
+    Important legal-name aliases:
+    Zepto POs now print "ZEPTO LIMITED", while older masters / ledgers can
+    still contain "Kiranakart Technologies Pvt. Ltd.". Both represent the
+    same customer family for Ship-to mapping and therefore must resolve to
+    the same canonical key.
+    """
     s = text_value(value).upper().strip()
     s = s.replace("&", " AND ")
     s = re.sub(r"\bPVT\.?\b", " PRIVATE ", s)
     s = re.sub(r"\bLTD\.?\b", " LIMITED ", s)
-    return re.sub(r"[^A-Z0-9]+", "", s)
+
+    compact = re.sub(r"[^A-Z0-9]+", "", s)
+
+    # Zepto legal-name transition / legacy master compatibility.
+    if (
+        "ZEPTOLIMITED" in compact
+        or "ZEPTOPRIVATELIMITED" in compact
+        or "KIRANAKARTTECHNOLOGIESPRIVATELIMITED" in compact
+        or "KIRANAKARTTECHNOLOGIESLIMITED" in compact
+    ):
+        return "ZEPTO"
+
+    return compact
 
 
 def normalize_pin_code(value):
@@ -3444,6 +3464,12 @@ def resolve_ship_to_code_priority(
     if po_pin:
         if po_ledger_k and (po_ledger_k, po_pin) in exact:
             return exact[(po_ledger_k, po_pin)]
+
+        # Zepto legal-name compatibility:
+        # PO may say ZEPTO LIMITED while master may still say
+        # Kiranakart Technologies Pvt. Ltd. canonical_ledger_name() maps
+        # both to ZEPTO, so the exact lookup above now resolves correctly.
+        # PIN-only remains a safe fallback only where the PIN has one code.
         if po_pin in unique_pin:
             return unique_pin[po_pin]
 
@@ -8207,7 +8233,7 @@ def user_working_summary(period_mode="Daily", selected_day=None, selected_month=
 # UI
 # =========================================================
 with st.sidebar:
-    st.caption("Database: Supabase PostgreSQL • V63.24 SEARCH + ROW PRICE EDIT" if USE_POSTGRES else "Database: Local SQLite • V63.24 SEARCH + ROW PRICE EDIT")
+    st.caption("Database: Supabase PostgreSQL • V63.25 ZEPTO SHIP-TO FIX" if USE_POSTGRES else "Database: Local SQLite • V63.25 ZEPTO SHIP-TO FIX")
     st.markdown("## Control Tower")
     page = st.radio(
         "Navigation",
