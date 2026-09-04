@@ -8207,7 +8207,7 @@ def user_working_summary(period_mode="Daily", selected_day=None, selected_month=
 # UI
 # =========================================================
 with st.sidebar:
-    st.caption("Database: Supabase PostgreSQL • V63.23 BLINKIT QTY/PRICE FIX" if USE_POSTGRES else "Database: Local SQLite • V63.23 BLINKIT QTY/PRICE FIX")
+    st.caption("Database: Supabase PostgreSQL • V63.24 SEARCH + ROW PRICE EDIT" if USE_POSTGRES else "Database: Local SQLite • V63.24 SEARCH + ROW PRICE EDIT")
     st.markdown("## Control Tower")
     page = st.radio(
         "Navigation",
@@ -8596,6 +8596,28 @@ if page == "Main Reconciliation Dashboard":
 
         authorized_grn = role in ["GRN / Returns","Logistics","Admin"]
         disabled_cols = [c for c in data.columns if c not in GRN_EDIT_COLUMNS]
+
+        # Real table search: only rows matching the search text remain visible.
+        # Search is applied across every displayed reconciliation column.
+        recon_search = st.text_input(
+            "Search reconciliation rows",
+            placeholder="Search PO, ledger, SKU, invoice, location, document no., etc.",
+            key="reconciliation_detail_search"
+        ).strip()
+
+        if recon_search:
+            search_terms = [t for t in recon_search.lower().split() if t]
+            if search_terms:
+                searchable = data.fillna("").astype(str).apply(
+                    lambda col: col.str.lower()
+                )
+                row_mask = pd.Series(True, index=data.index)
+                for term in search_terms:
+                    term_mask = searchable.apply(
+                        lambda col: col.str.contains(term, regex=False)
+                    ).any(axis=1)
+                    row_mask &= term_mask
+                data = data.loc[row_mask].copy()
 
         # Pagination keeps the page responsive even with a full FY Sale Register.
         total_rows = len(data)
@@ -9172,7 +9194,112 @@ elif page == "Customer SKU & Price Master":
            FROM sku_master
            ORDER BY ledger_name,customer_item_code"""
     )
-    st.dataframe(master, width="stretch", hide_index=True, height=520)
+
+    master_search = st.text_input(
+        "Search SKU / Price Master",
+        placeholder="Search ledger, customer item code, ERP item code, description, EAN, price...",
+        key="sku_price_master_search"
+    ).strip()
+
+    master_view = master.copy()
+    if master_search and not master_view.empty:
+        search_terms = [t for t in master_search.lower().split() if t]
+        searchable = master_view.fillna("").astype(str).apply(
+            lambda col: col.str.lower()
+        )
+        row_mask = pd.Series(True, index=master_view.index)
+        for term in search_terms:
+            term_mask = searchable.apply(
+                lambda col: col.str.contains(term, regex=False)
+            ).any(axis=1)
+            row_mask &= term_mask
+        master_view = master_view.loc[row_mask].copy()
+
+    st.caption(
+        f"Showing {len(master_view):,} of {len(master):,} master row(s). "
+        "Only the Price column is editable below."
+    )
+
+    if master_view.empty:
+        st.info("No matching master rows found.")
+    else:
+        editable_master = master_view.copy()
+        editable_master["price"] = pd.to_numeric(
+            editable_master["price"], errors="coerce"
+        ).fillna(0.0)
+
+        edited_master = st.data_editor(
+            editable_master,
+            width="stretch",
+            hide_index=True,
+            height=520,
+            disabled=[
+                c for c in editable_master.columns
+                if c != "price"
+            ],
+            column_config={
+                "price": st.column_config.NumberColumn(
+                    "price",
+                    min_value=0.0,
+                    step=0.01,
+                    format="%.2f",
+                    help="Edit the item price directly in this row."
+                )
+            },
+            key="sku_price_master_editor"
+        )
+
+        if st.button(
+            "Save Price Changes",
+            type="primary",
+            key="save_sku_master_price_changes"
+        ):
+            changed = 0
+            now_iso = datetime.now().isoformat(timespec="seconds")
+            con = open_db()
+            try:
+                original_by_key = {
+                    (
+                        text_value(r["ledger_name"]),
+                        text_value(r["customer_item_code"])
+                    ): number_value(r["price"])
+                    for _, r in editable_master.iterrows()
+                }
+
+                for _, r in edited_master.iterrows():
+                    ledger_key = text_value(r.get("ledger_name"))
+                    customer_item_key = text_value(r.get("customer_item_code"))
+                    new_price = number_value(r.get("price"))
+                    old_price = original_by_key.get(
+                        (ledger_key, customer_item_key),
+                        new_price
+                    )
+
+                    if abs(new_price - old_price) > 0.000001:
+                        con.execute(
+                            """UPDATE sku_master
+                               SET price=?, updated_at=?, updated_by=?
+                               WHERE ledger_name=? AND customer_item_code=?""",
+                            (
+                                new_price,
+                                now_iso,
+                                user,
+                                ledger_key,
+                                customer_item_key
+                            )
+                        )
+                        changed += 1
+
+                con.commit()
+            finally:
+                con.close()
+
+            if changed:
+                invalidate_dashboard_cache()
+                st.success(f"{changed} price row(s) updated successfully.")
+                st.rerun()
+            else:
+                st.info("No price changes detected.")
 
     if not master.empty:
         out = io.BytesIO()
