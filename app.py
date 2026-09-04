@@ -2273,13 +2273,34 @@ def parse_customer_po_pdf_by_mapping(raw, source_file, upload_id):
                     continue
                 values = _pdf_row_values_from_mapping(row, line_maps)
 
-                if "BLINK" in profile.upper() and len(row) >= 13:
-                    values["PO Qty"] = number_value(row[10])
-                    landing_rate = number_value(row[9])
-                    values["PO Unit Price"] = (
-                        landing_rate / 1.18 if landing_rate else 0
-                    )
-                    values["PO Value"] = number_value(row[12])
+                if "BLINK" in profile.upper():
+                    # Blinkit Recommended Quantity Order (R.O.) fixed commercial fields.
+                    # Current Blinkit table:
+                    #   Tax Amt | Landing Rate | Qty. | MRP | Total Amt
+                    # pdfplumber returns these at indexes 9,10,11,12,13.
+                    #
+                    # IMPORTANT FOR B2B:
+                    # Use the PO Landing Rate itself as Unit Price. Do NOT divide by GST.
+                    # This is also the value maintained in Customer SKU & Price Master.
+                    if len(row) >= 14:
+                        landing_rate = number_value(row[10])
+                        blink_qty = number_value(row[11])
+                        blink_total = number_value(row[13])
+
+                        # Accept only a commercially consistent Blinkit row.
+                        expected_total = landing_rate * blink_qty
+                        total_ok = (
+                            blink_total <= 0
+                            or abs(expected_total - blink_total) <= max(1.0, abs(blink_total) * 0.001)
+                        )
+                        if landing_rate > 0 and blink_qty > 0 and total_ok:
+                            values["PO Qty"] = blink_qty
+                            values["PO Unit Price"] = landing_rate
+                            values["PO Value"] = blink_total
+                        else:
+                            # Reject shifted/malformed numeric columns instead of
+                            # silently staging a wrong quantity or price.
+                            continue
 
                 if "METRO" in profile.upper() and len(row) >= 11:
                     ea_qty, ea_unit_price, total_base_value = _metro_ea_qty_and_unit_price(row)
@@ -8029,10 +8050,43 @@ def build_b2b_order_staging():
         qty_b2b = number_value(r.get("po_qty"))
         price_b2b = number_value(r.get("po_unit_price"))
         master_price_b2b = number_value(r.get("_master_price"))
-        if "BLINK" in ledger.upper() and qty_b2b > 500 and 0 < price_b2b <= 500:
-            # Legacy reversed rows require PO reprocessing under V63.17.
-            # Do not substitute MRP as Unit Price here.
-            qty_b2b = price_b2b
+
+        if "BLINK" in ledger.upper():
+            # Repair legacy/corrupted Blinkit rows already stored in po_lines.
+            # Blinkit B2B Unit Price must equal the PO Landing Rate / master price.
+            # When PO Total Amount is available, Quantity can be safely rebuilt as:
+            #     Total Amount / Landing Rate
+            po_total_b2b = number_value(r.get("po_value"))
+
+            # Detect clearly corrupt values such as Qty=1.649 / Price=1.649
+            # against a valid master landing rate of 1695.
+            price_is_corrupt = (
+                master_price_b2b > 0
+                and (
+                    price_b2b <= 0
+                    or abs(price_b2b - master_price_b2b) > 0.01
+                )
+            )
+
+            derived_qty = 0.0
+            if master_price_b2b > 0 and po_total_b2b > 0:
+                derived_qty = po_total_b2b / master_price_b2b
+                # Blinkit R.O. quantity is EA and should reconcile almost exactly.
+                if abs(derived_qty - round(derived_qty)) <= 0.01:
+                    derived_qty = float(round(derived_qty))
+                else:
+                    derived_qty = 0.0
+
+            qty_is_corrupt = (
+                qty_b2b <= 0
+                or (0 < qty_b2b < 1)
+                or (derived_qty > 0 and abs(qty_b2b - derived_qty) > 0.01)
+            )
+
+            if price_is_corrupt:
+                price_b2b = master_price_b2b
+            if qty_is_corrupt and derived_qty > 0:
+                qty_b2b = derived_qty
 
         if price_b2b > 0 and master_price_b2b > 0:
             price_diff = round(price_b2b - master_price_b2b, 2)
@@ -8153,7 +8207,7 @@ def user_working_summary(period_mode="Daily", selected_day=None, selected_month=
 # UI
 # =========================================================
 with st.sidebar:
-    st.caption("Database: Supabase PostgreSQL • V63.22 PRICE MISMATCH ALERT" if USE_POSTGRES else "Database: Local SQLite • V63.22 PRICE MISMATCH ALERT")
+    st.caption("Database: Supabase PostgreSQL • V63.23 BLINKIT QTY/PRICE FIX" if USE_POSTGRES else "Database: Local SQLite • V63.23 BLINKIT QTY/PRICE FIX")
     st.markdown("## Control Tower")
     page = st.radio(
         "Navigation",
