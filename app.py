@@ -2113,15 +2113,81 @@ def repair_pdf_po_header(profile, full_text, header):
 
     elif "ZEPTO" in p:
         m = re.search(r"PO\s+No\s*:\s*([A-Z0-9-]+)", full_text, re.I)
-        if m: h["PO No"] = m.group(1)
+        if m:
+            h["PO No"] = m.group(1)
+
         m = re.search(r"PO\s+Date\s*:\s*(\d{4}-\d{2}-\d{2})", full_text, re.I)
-        if m: h["PO Date"] = _header_date(m.group(1))
+        if m:
+            h["PO Date"] = _header_date(m.group(1))
+
         m = re.search(r"PO\s+Expiry\s+Date\s*:\s*(\d{4}-\d{2}-\d{2})", full_text, re.I)
-        if m: h["PO Expiry/DELIVERY DATE"] = _header_date(m.group(1))
-        blocks = re.findall(r"Address\s*:\s*(ZEPTO\s+LIMITED.+?)(?=\s+GSTIN\s*:)", full_text, re.I|re.S)
-        if blocks: h["Ship to Location"] = _clean_po_address(blocks[-1])
+        if m:
+            h["PO Expiry/DELIVERY DATE"] = _header_date(m.group(1))
+
+        # Zepto's PDF text extraction is two-column and does NOT place
+        # "Address:" before "ZEPTO LIMITED". Typical extracted sequence is:
+        #   Billing Address Shipping Address
+        #   ZEPTO LIMITED ... ZEPTO LIMITED ...
+        #   GUR-... GUR-...
+        #   Address: Address:
+        #   Block ... Block ...
+        #   Gurugram,Haryana India-124103 ... India-124103
+        #
+        # Therefore the older Address -> ZEPTO regex returned nothing and
+        # po_lines.ship_to_location stayed blank. B2B could not resolve Ship.
+        zepto_section = ""
+        sec = re.search(
+            r"Billing\s+Address\s+Shipping\s+Address(.*?)(?="
+            r"(?:Unit\s+Base\s+Taxable|Sr\.\s+Material\s+Code|"
+            r"Total\s+Taxable\s+Amount))",
+            full_text,
+            re.I | re.S
+        )
+        if sec:
+            zepto_section = sec.group(1)
+
+        # First preference: use the entire billing/shipping block because it
+        # reliably contains the destination PIN even when the two columns are
+        # merged into one extracted text stream.
+        if zepto_section:
+            destination_pins = re.findall(
+                r"(?<!\d)(\d{6})(?!\d)",
+                zepto_section
+            )
+            if destination_pins:
+                destination_pin = destination_pins[-1]
+                # Store a concise but useful Ship-to value with the exact PIN.
+                wh = re.findall(
+                    r"([A-Z]{2,}-[A-Z0-9-]+\s*\([A-Z0-9]+\))",
+                    zepto_section,
+                    re.I
+                )
+                warehouse = wh[-1] if wh else "ZEPTO LIMITED"
+                h["Ship to Location"] = _clean_po_address(
+                    f"{warehouse} PIN {destination_pin}"
+                )
+
+        # Fallback for alternate Zepto layouts where Address precedes the
+        # customer name normally.
+        if not extract_pin_from_text(h.get("Ship to Location","")):
+            blocks = re.findall(
+                r"Address\s*:\s*(ZEPTO\s+LIMITED.+?)(?=\s+GSTIN\s*:)",
+                full_text,
+                re.I | re.S
+            )
+            if blocks:
+                h["Ship to Location"] = _clean_po_address(blocks[-1])
+
+        # Last conservative fallback: use a PIN found specifically inside the
+        # billing/shipping section, never an arbitrary material/vendor number.
+        if not extract_pin_from_text(h.get("Ship to Location","")) and zepto_section:
+            pins = re.findall(r"(?<!\d)(\d{6})(?!\d)", zepto_section)
+            if pins:
+                h["Ship to Location"] = f"ZEPTO LIMITED PIN {pins[-1]}"
+
         gst = re.findall(r"GSTIN\s*:\s*([0-9A-Z]{15})", full_text, re.I)
-        if gst: h["Ship to GST no as per PO"] = gst[-1].upper()
+        if gst:
+            h["Ship to GST no as per PO"] = gst[-1].upper()
 
     elif "CP WHOLESALE" in p or "LOTS" in p:
         m = re.search(r"P\.O\s+No\s*:\s*([0-9]+)", full_text, re.I)
@@ -8233,7 +8299,7 @@ def user_working_summary(period_mode="Daily", selected_day=None, selected_month=
 # UI
 # =========================================================
 with st.sidebar:
-    st.caption("Database: Supabase PostgreSQL • V63.25 ZEPTO SHIP-TO FIX" if USE_POSTGRES else "Database: Local SQLite • V63.25 ZEPTO SHIP-TO FIX")
+    st.caption("Database: Supabase PostgreSQL • V63.26 ZEPTO SHIP-TO PARSER FIX" if USE_POSTGRES else "Database: Local SQLite • V63.26 ZEPTO SHIP-TO PARSER FIX")
     st.markdown("## Control Tower")
     page = st.radio(
         "Navigation",
