@@ -339,6 +339,23 @@ def init_db():
             updated_at TEXT
         )""")
 
+        con.execute("""CREATE TABLE IF NOT EXISTS sales_order_detail(
+            erp_sales_order_no TEXT PRIMARY KEY,
+            po_no TEXT,
+            ledger_name TEXT,
+            user_id TEXT,
+            created_date TEXT,
+            updated_at TEXT
+        )""")
+        con.execute(
+            "CREATE INDEX IF NOT EXISTS idx_sales_order_detail_po "
+            "ON sales_order_detail(po_no)"
+        )
+        con.execute(
+            "CREATE INDEX IF NOT EXISTS idx_sales_order_detail_user_date "
+            "ON sales_order_detail(user_id, created_date)"
+        )
+
         con.execute("""CREATE TABLE IF NOT EXISTS ship_to_location_master(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             ledger_name TEXT NOT NULL,
@@ -3998,13 +4015,21 @@ def rebuild_consolidated_sale_register_row_preserving():
 # =========================================================
 def import_sales_orders(df):
     """
-    Current reviewed Sales Order export format:
-      No.             = ERP Sales Order No.
-      Customer PO No. = Customer PO reference
-      Created By      = Billing ID
-      Document Date   = Sales Order creation date
+    Fast, row-preserving Sales Order import for the current ERP export.
 
-    Header-based mapping is used so physical Excel column positions can change.
+    Current headers:
+      No.                   -> ERP Sales Order No.
+      Customer PO No.       -> Customer PO reference
+      Created By            -> Billing ID
+      Document Date         -> SO creation date
+      Sell-to Customer Name -> Ledger Name
+
+    Two stores are maintained:
+      1) sales_order_detail: every unique ERP Sales Order (for productivity)
+      2) sales_order_map: PO -> one ERP SO mapping used by reconciliation
+
+    This avoids the old one-query-per-row upload path, which was too slow on
+    Streamlit Cloud and could leave Upload History stuck at "Processing / 0".
     """
     if df is None or df.empty:
         raise ValueError("Sales Order file is empty.")
@@ -4016,73 +4041,104 @@ def import_sales_orders(df):
         df,
         ["Document Date", "Created Date", "SO Created Date", "Sales Order Date", "Order Date"]
     )
+    c_ledger = find_col(
+        df,
+        ["Sell-to Customer Name", "Ledger Name", "Customer Name"]
+    )
 
     if c_so is None:
         raise ValueError("Sales Order column 'No.' was not found.")
     if c_po is None:
         raise ValueError("Sales Order column 'Customer PO No.' was not found.")
 
-    con = open_db()
-    updated = skipped = 0
-    try:
-        for _, r in df.iterrows():
-            so = text_value(r.get(c_so))
-            po = text_value(r.get(c_po))
+    now_iso = datetime.now().isoformat(timespec="seconds")
 
-            if not so or not po:
-                skipped += 1
-                continue
+    detail_rows = []
+    mapping_by_po = {}
+    skipped = 0
 
-            source_user = text_value(r.get(c_user)) if c_user is not None else ""
-            if not source_user:
-                source_user = text_value(globals().get("user", ""))
-            created_date = (
-                date_value(r.get(c_created_date))
-                if c_created_date is not None
-                else datetime.now().strftime("%Y-%m-%d")
+    for _, r in df.iterrows():
+        so = text_value(r.get(c_so)).strip()
+        po = text_value(r.get(c_po)).strip()
+        source_user = text_value(r.get(c_user)).strip() if c_user is not None else ""
+        ledger_name = text_value(r.get(c_ledger)).strip() if c_ledger is not None else ""
+
+        if not source_user:
+            source_user = text_value(globals().get("user", "")).strip()
+
+        created_date = (
+            date_value(r.get(c_created_date))
+            if c_created_date is not None
+            else datetime.now().strftime("%Y-%m-%d")
+        )
+
+        if not so:
+            skipped += 1
+            continue
+
+        detail_rows.append(
+            (so, po, ledger_name, source_user, created_date, now_iso)
+        )
+
+        # Reconciliation mapping requires a PO. If multiple SOs exist for the
+        # same PO, keep the latest row from the uploaded ERP export.
+        if po:
+            mapping_by_po[po] = (
+                po, so, ledger_name, source_user, created_date, now_iso
             )
 
-            existing = con.execute(
-                """SELECT erp_sales_order_no,user_id,created_date
-                   FROM sales_order_map
-                   WHERE po_no=? LIMIT 1""",
-                (po,)
-            ).fetchone()
-            if (
-                existing
-                and text_value(existing[0]).strip() == so.strip()
-                and text_value(existing[1]).strip() == source_user.strip()
-                and text_value(existing[2]).strip() == created_date.strip()
-            ):
-                skipped += 1
-                continue
+    # Remove duplicate SOs inside the uploaded file, keeping the last occurrence.
+    detail_by_so = {}
+    for row in detail_rows:
+        detail_by_so[row[0].upper()] = row
+    detail_rows = list(detail_by_so.values())
 
-            con.execute(
+    if not detail_rows:
+        raise ValueError("No valid ERP Sales Order rows were found in the file.")
+
+    con = open_db()
+    try:
+        # Preserve every unique ERP Sales Order for Billing Productivity.
+        con.executemany(
+            """INSERT INTO sales_order_detail(
+                   erp_sales_order_no,po_no,ledger_name,user_id,created_date,updated_at
+               ) VALUES(?,?,?,?,?,?)
+               ON CONFLICT(erp_sales_order_no) DO UPDATE SET
+                   po_no=excluded.po_no,
+                   ledger_name=excluded.ledger_name,
+                   user_id=excluded.user_id,
+                   created_date=excluded.created_date,
+                   updated_at=excluded.updated_at""",
+            detail_rows
+        )
+
+        # Keep legacy PO -> SO map for Main Reconciliation.
+        if mapping_by_po:
+            con.executemany(
                 """INSERT INTO sales_order_map(
                        po_no,erp_sales_order_no,ledger_name,user_id,created_date,updated_at
                    ) VALUES(?,?,?,?,?,?)
                    ON CONFLICT(po_no) DO UPDATE SET
                        erp_sales_order_no=excluded.erp_sales_order_no,
+                       ledger_name=excluded.ledger_name,
                        user_id=excluded.user_id,
                        created_date=excluded.created_date,
                        updated_at=excluded.updated_at""",
-                (
-                    po,
-                    so,
-                    "",
-                    source_user,
-                    created_date,
-                    datetime.now().isoformat(timespec="seconds")
-                )
+                list(mapping_by_po.values())
             )
-            updated += 1
 
         con.commit()
     finally:
         con.close()
 
     invalidate_dashboard_cache()
-    return updated, skipped, str(c_so), str(c_po)
+    return (
+        len(detail_rows),          # actual SO rows loaded/updated
+        len(mapping_by_po),        # PO mappings loaded/updated
+        skipped,
+        str(c_so),
+        str(c_po),
+    )
 
 # =========================================================
 # BLOCKED SHIPMENT IMPORT
@@ -8632,7 +8688,7 @@ def user_working_summary(start_date=None, end_date=None):
     """
     so = read_sql(
         """SELECT po_no,erp_sales_order_no,user_id,created_date
-           FROM sales_order_map
+           FROM sales_order_detail
            WHERE TRIM(COALESCE(erp_sales_order_no,''))<>''"""
     )
 
@@ -8756,7 +8812,7 @@ def user_working_summary(start_date=None, end_date=None):
 # UI
 # =========================================================
 with st.sidebar:
-    st.caption("Database: Supabase PostgreSQL • V63.39 MASTER FULL EDIT + FILTER DOWNLOAD" if USE_POSTGRES else "Database: Local SQLite • V63.39 MASTER FULL EDIT + FILTER DOWNLOAD")
+    st.caption("Database: Supabase PostgreSQL • V63.40 SALES ORDER BULK UPLOAD FIX" if USE_POSTGRES else "Database: Local SQLite • V63.40 SALES ORDER BULK UPLOAD FIX")
     st.markdown("## Control Tower")
     page = st.radio(
         "Navigation",
@@ -10449,15 +10505,25 @@ elif page == "Upload Centre":
                         continue
 
                     df = read_excel(raw)
-                    updated, skipped, so_col, po_col = import_sales_orders(df)
-                    update_upload(uid,"Processed",len(df))
+                    so_loaded, po_mapped, skipped, so_col, po_col = import_sales_orders(df)
+                    update_upload(
+                        uid,
+                        f"Processed - {so_loaded} SO rows | {po_mapped} PO mappings",
+                        so_loaded
+                    )
 
                     st.success(
-                        f"{f.name}: {updated} PO → ERP Sales Order mappings updated; "
-                        f"{skipped} blank/unchanged rows skipped. "
+                        f"{f.name}: {so_loaded} Sales Order row(s) loaded/updated; "
+                        f"{po_mapped} Customer PO mapping(s) refreshed; "
+                        f"{skipped} row(s) skipped. "
                         f"Detected '{so_col}' as ERP Sales Order and '{po_col}' as Customer PO reference."
                     )
                 except Exception as e:
+                    try:
+                        if 'uid' in locals() and uid:
+                            update_upload(uid, f"Failed - {text_value(e)[:180]}", 0)
+                    except Exception:
+                        pass
                     st.error(f"{f.name}: {e}")
 
     with tabs[4]:
@@ -10958,9 +11024,9 @@ elif page == "Upload Centre":
 
     st.divider()
     st.markdown("### Upload History")
-    so_count_df = read_sql("SELECT COUNT(*) AS mapped_po_count FROM sales_order_map")
+    so_count_df = read_sql("SELECT COUNT(*) AS mapped_po_count FROM sales_order_detail")
     if not so_count_df.empty:
-        st.metric("Current PO → ERP Sales Order Mappings", int(so_count_df.iloc[0]["mapped_po_count"]))
+        st.metric("Current ERP Sales Orders Loaded", int(so_count_df.iloc[0]["mapped_po_count"]))
 
     history = read_sql(
         """SELECT id,source_type,file_name,uploaded_by,uploaded_at,status,rows_loaded
