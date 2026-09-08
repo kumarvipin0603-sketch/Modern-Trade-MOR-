@@ -6564,8 +6564,10 @@ def available_main_dashboard():
         # Dashboard-time repair for historical GRN rows that were loaded before
         # the ERP-link fix. Resolve a blank ERP by exact invoice + unique quantity
         # against Sale Register, without requiring the PDF to be uploaded again.
-        missing_erp = grn["erp_item_code_k"].fillna("").astype(str).str.strip().eq("")
-        if missing_erp.any() and not invoices.empty:
+        # Do not keep the missing-ERP mask in a branch-scoped variable.
+        # Recompute it explicitly so the dashboard cannot fail with NameError
+        # when a particular GRN/PO mapping branch is empty.
+        if not invoices.empty:
             inv_qty_lookup = {}
             for _, sr in invoices.iterrows():
                 inv_k = text_value(sr.get("invoice_no_k")).strip().upper()
@@ -6573,14 +6575,29 @@ def available_main_dashboard():
                 erp_k = text_value(sr.get("erp_item_code_k")).strip().upper()
                 sq = number_value(sr.get("qty"))
                 if inv_k and erp_k and sq > 0:
-                    inv_qty_lookup.setdefault((po_k, inv_k, round(sq, 6)), set()).add(erp_k)
+                    inv_qty_lookup.setdefault(
+                        (po_k, inv_k, round(sq, 6)), set()
+                    ).add(erp_k)
 
-            for ix in grn.index[missing_erp]:
+            unresolved_mask = (
+                grn["erp_item_code_k"]
+                .fillna("")
+                .astype(str)
+                .str.strip()
+                .eq("")
+            )
+
+            for ix in grn.index[unresolved_mask]:
                 po_k = text_value(grn.at[ix, "po_no_k"]).strip().upper()
                 inv_k = text_value(grn.at[ix, "invoice_no_k"]).strip().upper()
-                gq = number_value(grn.at[ix, "invoice_qty"])
+
+                # Older normalized GRN rows may not contain invoice_qty.
+                gq = 0.0
+                if "invoice_qty" in grn.columns:
+                    gq = number_value(grn.at[ix, "invoice_qty"])
                 if gq <= 0:
                     gq = number_value(grn.at[ix, "grn_qty"])
+
                 vals = inv_qty_lookup.get((po_k, inv_k, round(gq, 6)), set())
                 if len(vals) == 1:
                     erp_val = next(iter(vals))
@@ -8447,7 +8464,7 @@ def user_working_summary(period_mode="Daily", selected_day=None, selected_month=
 # UI
 # =========================================================
 with st.sidebar:
-    st.caption("Database: Supabase PostgreSQL • V63.30 GRN RECONCILIATION LINK FIX" if USE_POSTGRES else "Database: Local SQLite • V63.30 GRN RECONCILIATION LINK FIX")
+    st.caption("Database: Supabase PostgreSQL • V63.31 GRN DASHBOARD ERROR FIX" if USE_POSTGRES else "Database: Local SQLite • V63.31 GRN DASHBOARD ERROR FIX")
     st.markdown("## Control Tower")
     page = st.radio(
         "Navigation",
