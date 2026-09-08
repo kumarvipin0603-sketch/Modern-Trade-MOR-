@@ -4852,7 +4852,192 @@ def detect_pdf_grn_profile(raw):
     return profile, chosen, full_text, tables
 
 
+
+def _parse_known_grn_pdf(raw):
+    """
+    Built-in normalization for reviewed customer GRN layouts.
+
+    Supported:
+      - METRO CASH & CARRY INDIA LIMITED
+      - Wal-Mart India Private Limited GOODS RECEIVING NOTE
+
+    This parser intentionally runs before configurable mapping profiles so
+    these two stable layouts cannot fail due to an incorrect Start Row,
+    TABLE_COLUMN mapping, generic profile selection, or legacy template.
+    """
+    if not PDFPLUMBER_AVAILABLE or pdfplumber is None:
+        return None
+
+    with pdfplumber.open(io.BytesIO(raw)) as pdf:
+        full_text = "\n".join((p.extract_text() or "") for p in pdf.pages)
+        tables = []
+        for p in pdf.pages:
+            tables.extend(p.extract_tables() or [])
+
+    upper_text = full_text.upper()
+
+    # -----------------------------
+    # METRO CASH & CARRY
+    # -----------------------------
+    if "METRO CASH & CARRY INDIA LIMITED" in upper_text and "GOODS RECEIPT NOTE" in upper_text:
+        def _rx(pattern):
+            m = re.search(pattern, full_text, re.I | re.S)
+            return text_value(m.group(1)).strip() if m else ""
+
+        header = {
+            "Ledger Name": "Metro Cash & Carry India Pvt. Ltd.",
+            "PO No": _rx(r"PO\s+Number\s*:\s*([A-Z0-9\-/]+)"),
+            "Invoice No": _rx(r"Vendor\s+invoice\s+no\s*:\s*([A-Z0-9\-/]+)"),
+            "GRN No": _rx(r"GOODS\s+RECEIPT\s+NOTE\s+No\.\s*:\s*([A-Z0-9\-/]+)"),
+            "GRN Date": _rx(r"GOODS\s+RECEIPT\s+NOTE\s+No\.\s*:\s*[A-Z0-9\-/]+\s+Date\s*:\s*([0-9.]+)"),
+            "Transporter": _rx(r"Transporter\s+Details\s*:\s*Name\s*:\s*([^\n]+)"),
+            "Docket No": _rx(r"Consignment\s+Note\s*:\s*([^\s]+)"),
+        }
+
+        # Find the actual item table by its headers, not by table number.
+        item_table = None
+        for table in tables:
+            if not table:
+                continue
+            header_join = " ".join(
+                text_value(c) for row in table[:6] for c in (row or [])
+            ).upper()
+            if "ARTICLE" in header_join and "RECIEVED" in header_join and "CHALLAN" in header_join:
+                item_table = table
+                break
+
+        if item_table:
+            added = duplicates = 0
+            parsed = []
+            con = open_db()
+            try:
+                for row in item_table:
+                    if not row or len(row) < 6:
+                        continue
+
+                    # True Metro item row has multiple serial/article/qty values
+                    # packed into newline-separated cells.
+                    serials = [x.strip() for x in re.split(r"[\r\n]+", text_value(row[0])) if x.strip()]
+                    articles = [x.strip() for x in re.split(r"[\r\n]+", text_value(row[1])) if x.strip()]
+                    descriptions = [x.strip() for x in re.split(r"[\r\n]+", text_value(row[2])) if x.strip()]
+                    challan = [x.strip() for x in re.split(r"[\r\n]+", text_value(row[4])) if x.strip()]
+                    received = [x.strip() for x in re.split(r"[\r\n]+", text_value(row[5])) if x.strip()]
+
+                    if not articles or len(received) != len(articles):
+                        continue
+                    if serials and not all(re.fullmatch(r"\d+", s) for s in serials):
+                        continue
+
+                    # Build one normalized row per article.
+                    # Description extraction from Metro's merged description cell
+                    # is not required for reconciliation; article + invoice qty
+                    # are sufficient to resolve the ERP item safely.
+                    for i, article in enumerate(articles):
+                        values = dict(header)
+                        values["Customer Item Code"] = article
+                        values["Invoice Qty"] = number_value(challan[i]) if i < len(challan) else 0
+                        values["GRN Qty"] = number_value(received[i])
+                        values["Item Description"] = ""
+
+                        if _grn_insert_row(con, values, "Built-in PDF:METRO"):
+                            added += 1
+                        else:
+                            duplicates += 1
+
+                        preview = dict(values)
+                        preview["Profile"] = "METRO BUILT-IN"
+                        parsed.append(preview)
+
+                con.commit()
+            finally:
+                con.close()
+
+            if parsed:
+                invalidate_dashboard_cache()
+                return {
+                    "profile": "METRO BUILT-IN",
+                    "added": added,
+                    "duplicates": duplicates,
+                    "rows": pd.DataFrame(parsed),
+                }
+
+    # -----------------------------
+    # WAL-MART INDIA
+    # -----------------------------
+    if "WAL-MART INDIA PRIVATE LIMITED" in upper_text and "GOODS RECEIVING NOTE" in upper_text:
+        def _rxw(pattern):
+            m = re.search(pattern, full_text, re.I | re.S)
+            return text_value(m.group(1)).strip() if m else ""
+
+        header = {
+            "Ledger Name": "Walmart India Pvt. Ltd.",
+            "PO No": _rxw(r"PO\s*#\s*([A-Z0-9\-/]+)"),
+            "Invoice No": _rxw(r"Invoice\s*#\s*([A-Z0-9\-/]+)"),
+            "Invoice Date": _rxw(r"Inv\s+Date\s*#\s*([0-9A-Za-z-]+)"),
+            "GRN No": _rxw(r"GRN\s*#\s*([A-Z0-9\-/]+)"),
+            "GRN Date": _rxw(r"GRN\s+Date\s*#\s*([0-9A-Za-z-]+)"),
+        }
+
+        item_table = None
+        for table in tables:
+            if not table:
+                continue
+            header_join = " ".join(
+                text_value(c) for row in table[:5] for c in (row or [])
+            ).upper()
+            if "ITEM#" in header_join and "QTY RECD" in header_join and "PO COST" in header_join:
+                item_table = table
+                break
+
+        if item_table:
+            added = duplicates = 0
+            parsed = []
+            con = open_db()
+            try:
+                for row in item_table:
+                    if not row or len(row) < 12:
+                        continue
+
+                    item_no = text_value(row[0]).strip()
+                    if not re.fullmatch(r"\d+", item_no):
+                        continue
+
+                    values = dict(header)
+                    values["Customer Item Code"] = item_no
+                    values["Item Description"] = text_value(row[1]).strip()
+                    values["Invoice Qty"] = number_value(row[9])
+                    values["GRN Qty"] = number_value(row[11])
+
+                    if _grn_insert_row(con, values, "Built-in PDF:WALMART"):
+                        added += 1
+                    else:
+                        duplicates += 1
+
+                    preview = dict(values)
+                    preview["Profile"] = "WALMART BUILT-IN"
+                    parsed.append(preview)
+
+                con.commit()
+            finally:
+                con.close()
+
+            if parsed:
+                invalidate_dashboard_cache()
+                return {
+                    "profile": "WALMART BUILT-IN",
+                    "added": added,
+                    "duplicates": duplicates,
+                    "rows": pd.DataFrame(parsed),
+                }
+
+    return None
+
+
 def parse_grn_pdf_by_mapping(raw):
+    known = _parse_known_grn_pdf(raw)
+    if known is not None:
+        return known
+
     profile, mappings, full_text, tables = detect_pdf_grn_profile(raw)
     if not profile or mappings.empty:
         return None
@@ -5049,12 +5234,21 @@ def reprocess_stored_grn_files():
     errors = []
 
     for _, u in uploads.iterrows():
-        p = Path(text_value(u["stored_path"]))
-        if not p.exists():
+        try:
+            p = materialize_upload_if_missing(
+                int(u["id"]),
+                text_value(u["stored_path"]),
+                text_value(u["file_name"]) or "grn_source"
+            )
+        except Exception as e:
+            errors.append(f"{u['file_name']}: could not materialize stored file - {e}")
+            continue
+
+        if not p or not Path(p).exists():
             errors.append(f"{u['file_name']}: stored file not found")
             continue
 
-        raw = p.read_bytes()
+        raw = Path(p).read_bytes()
         name = text_value(u["file_name"])
         try:
             if name.lower().endswith(".pdf"):
@@ -8464,7 +8658,7 @@ def user_working_summary(period_mode="Daily", selected_day=None, selected_month=
 # UI
 # =========================================================
 with st.sidebar:
-    st.caption("Database: Supabase PostgreSQL • V63.32 GRN DASHBOARD INV FIX" if USE_POSTGRES else "Database: Local SQLite • V63.32 GRN DASHBOARD INV FIX")
+    st.caption("Database: Supabase PostgreSQL • V63.33 GRN REPROCESS + PARSER FIX" if USE_POSTGRES else "Database: Local SQLite • V63.33 GRN REPROCESS + PARSER FIX")
     st.markdown("## Control Tower")
     page = st.radio(
         "Navigation",
@@ -8523,7 +8717,7 @@ if all_col.button("Show All", width="stretch"):
 if page == "Main Reconciliation Dashboard":
     st.subheader("Main Reconciliation Dashboard")
 
-    refresh_c1, refresh_c2 = st.columns([1,5])
+    refresh_c1, repair_c, refresh_c2 = st.columns([1,1.35,4.65])
     with refresh_c1:
         if st.button(
             "Refresh Reconciliation",
@@ -8533,6 +8727,31 @@ if page == "Main Reconciliation Dashboard":
             refresh_po_erp_mappings_live()
             invalidate_dashboard_cache()
             st.rerun()
+
+    with repair_c:
+        if st.button(
+            "Repair / Reprocess GRNs",
+            key="repair_reprocess_grns_main",
+            help="Re-read stored GRN PDFs, normalize Metro/Walmart rows and relink them to reconciliation."
+        ):
+            try:
+                with st.spinner("Repairing stored GRNs..."):
+                    rr = reprocess_stored_grn_files()
+                invalidate_dashboard_cache()
+                if rr["errors"]:
+                    st.warning(
+                        f"GRN repair completed with {len(rr['errors'])} warning(s). "
+                        + " | ".join(rr["errors"][:3])
+                    )
+                else:
+                    st.success(
+                        f"GRN repair completed: {rr['files']} file(s), "
+                        f"{rr['rows']} normalized row(s) checked."
+                    )
+                st.rerun()
+            except Exception as e:
+                st.error(f"GRN repair failed: {e}")
+
     with refresh_c2:
         live_po_count = safe_table_count("po_lines")
         st.caption(
