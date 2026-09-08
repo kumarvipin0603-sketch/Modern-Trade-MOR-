@@ -3994,53 +3994,33 @@ def rebuild_consolidated_sale_register_row_preserving():
 
 
 # =========================================================
-# SALES ORDERS - header based import (new ERP export format)
+# SALES ORDERS - current ERP export format (header based)
 # =========================================================
 def import_sales_orders(df):
     """
-    New Sales Order upload format reviewed from the current ERP export.
+    Current reviewed Sales Order export format:
+      No.             = ERP Sales Order No.
+      Customer PO No. = Customer PO reference
+      Created By      = Billing ID
+      Document Date   = Sales Order creation date
 
-    Required fields:
-      No.                 -> ERP Sales Order No.
-      Customer PO No.     -> Customer PO reference
-
-    Additional fields used:
-      Created By          -> Billing ID / User ID
-      Document Date       -> Sales Order creation date
-      Sell-to Customer Name -> Ledger Name
-
-    The importer is header-based instead of fixed-column based, so the
-    columns can move without breaking the upload.
+    Header-based mapping is used so physical Excel column positions can change.
     """
     if df is None or df.empty:
         raise ValueError("Sales Order file is empty.")
 
-    c_so = find_col(
-        df,
-        ["No.","No","Sales Order No.","Sales Order No","ERP Sales Order No","Order No.","Order No"]
-    )
-    c_po = find_col(
-        df,
-        ["Customer PO No.","Customer PO No","Customer PO Number","External Document No.","External Document No"]
-    )
-    c_user = find_col(
-        df,
-        ["Created By","User-ID","User ID","Assigned User ID","User"]
-    )
+    c_so = find_col(df, ["No.", "No", "Sales Order No.", "Sales Order No"])
+    c_po = find_col(df, ["Customer PO No.", "Customer PO No", "Customer PO Number"])
+    c_user = find_col(df, ["Created By", "User-ID", "User ID", "Assigned User ID"])
     c_created_date = find_col(
         df,
-        ["Document Date","Created Date","SO Created Date","Sales Order Date","Order Date","Posting Date","Date"]
-    )
-    c_ledger = find_col(
-        df,
-        ["Sell-to Customer Name","Ledger Name","Customer Name","Bill to Customer Name"]
+        ["Document Date", "Created Date", "SO Created Date", "Sales Order Date", "Order Date"]
     )
 
-    if c_so is None or c_po is None:
-        raise ValueError(
-            "Sales Order file must contain 'No.' and 'Customer PO No.' columns. "
-            "The current ERP export format is supported directly."
-        )
+    if c_so is None:
+        raise ValueError("Sales Order column 'No.' was not found.")
+    if c_po is None:
+        raise ValueError("Sales Order column 'Customer PO No.' was not found.")
 
     con = open_db()
     updated = skipped = 0
@@ -4056,14 +4036,11 @@ def import_sales_orders(df):
             source_user = text_value(r.get(c_user)) if c_user is not None else ""
             if not source_user:
                 source_user = text_value(globals().get("user", ""))
-
             created_date = (
                 date_value(r.get(c_created_date))
                 if c_created_date is not None
                 else datetime.now().strftime("%Y-%m-%d")
             )
-
-            ledger_name = text_value(r.get(c_ledger)) if c_ledger is not None else ""
 
             existing = con.execute(
                 """SELECT erp_sales_order_no,user_id,created_date
@@ -4092,7 +4069,7 @@ def import_sales_orders(df):
                 (
                     po,
                     so,
-                    ledger_name,
+                    "",
                     source_user,
                     created_date,
                     datetime.now().isoformat(timespec="seconds")
@@ -8779,7 +8756,7 @@ def user_working_summary(start_date=None, end_date=None):
 # UI
 # =========================================================
 with st.sidebar:
-    st.caption("Database: Supabase PostgreSQL • V63.37 NEW SALES ORDER UPLOAD FORMAT" if USE_POSTGRES else "Database: Local SQLite • V63.37 NEW SALES ORDER UPLOAD FORMAT")
+    st.caption("Database: Supabase PostgreSQL • V63.38 SALES ORDER FORMAT SAFE FIX" if USE_POSTGRES else "Database: Local SQLite • V63.38 SALES ORDER FORMAT SAFE FIX")
     st.markdown("## Control Tower")
     page = st.radio(
         "Navigation",
@@ -10252,14 +10229,13 @@ elif page == "Upload Centre":
 
     with tabs[3]:
         st.caption(
-            "Current Sales Order format: No. = ERP Sales Order No. | "
-            "Customer PO No. = PO reference | Created By = Billing ID | "
-            "Document Date = SO creation date"
+            "Current ERP format: No. = ERP Sales Order No. | "
+            "Customer PO No. = Customer PO reference | "
+            "Created By = Billing ID | Document Date = SO creation date"
         )
         st.info(
-            "Upload the ERP Sales Orders Excel in its current original format. "
-            "Column positions can change; matching is now done by column header. "
-            "Duplicate protection remains active."
+            "Sales Order upload is now header-based. The app does not depend on "
+            "fixed Excel column positions."
         )
         files = st.file_uploader(
             "Upload Latest Sales Orders",
@@ -10270,19 +10246,18 @@ elif page == "Upload Centre":
         if files:
             try:
                 preview_df = read_excel(files[0].getvalue())
-                p_so = find_col(preview_df, ["No.","No","Sales Order No.","Sales Order No","ERP Sales Order No"])
-                p_po = find_col(preview_df, ["Customer PO No.","Customer PO No","Customer PO Number"])
-                p_user = find_col(preview_df, ["Created By","User-ID","User ID","Assigned User ID"])
-                p_date = find_col(preview_df, ["Document Date","Created Date","SO Created Date","Sales Order Date"])
+                p_so = find_col(preview_df, ["No.", "No", "Sales Order No.", "Sales Order No"])
+                p_po = find_col(preview_df, ["Customer PO No.", "Customer PO No", "Customer PO Number"])
+                p_user = find_col(preview_df, ["Created By", "User-ID", "User ID"])
+                p_date = find_col(preview_df, ["Document Date", "Created Date", "Sales Order Date"])
                 st.caption(
-                    "File check: "
-                    f"SO='{p_so or 'NOT FOUND'}' | "
-                    f"Customer PO='{p_po or 'NOT FOUND'}' | "
+                    f"Detected: SO='{p_so or 'NOT FOUND'}' | "
+                    f"PO='{p_po or 'NOT FOUND'}' | "
                     f"Billing ID='{p_user or 'NOT FOUND'}' | "
                     f"SO Date='{p_date or 'NOT FOUND'}'"
                 )
-            except Exception:
-                pass
+            except Exception as e:
+                st.warning(f"Could not preview Sales Order headers: {e}")
         if st.button("Process Sales Orders", type="primary"):
             if not files:
                 st.warning("Choose at least one Sales Order file.")
@@ -10301,7 +10276,7 @@ elif page == "Upload Centre":
                     st.success(
                         f"{f.name}: {updated} PO → ERP Sales Order mappings updated; "
                         f"{skipped} blank/unchanged rows skipped. "
-                        f"Used '{so_col}' for ERP Sales Order and '{po_col}' for Customer PO reference."
+                        f"Detected '{so_col}' as ERP Sales Order and '{po_col}' as Customer PO reference."
                     )
                 except Exception as e:
                     st.error(f"{f.name}: {e}")
