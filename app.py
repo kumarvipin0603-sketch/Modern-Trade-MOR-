@@ -1400,6 +1400,30 @@ def save_upload(source_type, f, user):
                 prev_path = text_value(duplicate[3])
                 return raw, (Path(prev_path) if prev_path else None), duplicate[0], False
 
+            if source_u == "SALES ORDERS":
+                previous_status = text_value(duplicate[1]).upper()
+                previous_rows = int(number_value(duplicate[2]))
+                if (
+                    previous_status.startswith("PROCESSING")
+                    or previous_status.startswith("FAILED")
+                    or previous_rows <= 0
+                ):
+                    con.execute(
+                        """UPDATE uploads
+                           SET status=?,uploaded_by=?,uploaded_at=?,file_blob=?
+                           WHERE id=?""",
+                        (
+                            "Reprocessing Sales Orders",
+                            user,
+                            datetime.now().isoformat(timespec="seconds"),
+                            psycopg2.Binary(raw) if USE_POSTGRES else raw,
+                            duplicate[0],
+                        )
+                    )
+                    con.commit()
+                    prev_path = text_value(duplicate[3])
+                    return raw, (Path(prev_path) if prev_path else None), duplicate[0], False
+
             return raw, None, duplicate[0], True
     finally:
         con.close()
@@ -2350,7 +2374,9 @@ def repair_pdf_po_header(profile, full_text, header):
 
     if "BLINK" in p:
         m = re.search(r"R\.O\.\s*Number\s*:\s*([0-9]+)", full_text, re.I)
-        if m: h["PO No"] = m.group(1)
+        if m:
+            h["PO No"] = m.group(1)
+
         m = re.search(
             r"R\.O\.\s*Number\s*:\s*[0-9]+.*?\bDate\s*:\s*"
             r"([A-Za-z]{3,9}\.?\s+\d{1,2},\s+\d{4})",
@@ -2364,18 +2390,67 @@ def repair_pdf_po_header(profile, full_text, header):
         if m:
             h["PO Date"] = _header_date(m.group(1))
 
+        # Blinkit PDF is visually two-column. pdfplumber can extract the
+        # expiry label as "R.O. expiry :Oct... Delivered ... date", so support
+        # both the visual and extracted text orders.
         flat_text = re.sub(r"\s+", " ", full_text)
-        m = re.search(
+
+        expiry_patterns = [
             r"R\.O\.\s*expiry\s*date\s*:\s*"
             r"([A-Za-z]{3,9}\.?\s+\d{1,2},\s+\d{4})",
-            flat_text, re.I
+            r"R\.O\.\s*expiry\s*:\s*"
+            r"([A-Za-z]{3,9}\.?\s+\d{1,2},\s+\d{4})",
+        ]
+        for pat in expiry_patterns:
+            m = re.search(pat, flat_text, re.I)
+            if m:
+                h["PO Expiry/DELIVERY DATE"] = _header_date(m.group(1))
+                break
+
+        # Current extraction sequence is:
+        # Delivered :BLINK COMMERCE PRIVATE LIMITED GST No. :03... To <address>
+        ship = re.search(
+            r"Delivered\s*:\s*BLINK\s+COMMERCE\s+PRIVATE\s+LIMITED\s+"
+            r"GST\s+No\.\s*:\s*([0-9A-Z]{15})\s+To\s+"
+            r"(.+?)(?=\s+#\s+Item|\s+#\s+HSN|\s+#\s+Item\s+HSN)",
+            flat_text,
+            re.I | re.S
         )
-        if m:
-            h["PO Expiry/DELIVERY DATE"] = _header_date(m.group(1))
-        m = re.search(r"Delivered\s+To\s*:\s*(.+?)(?=\s*GST\s+No\.\s*:)", full_text, re.I|re.S)
-        if m: h["Ship to Location"] = _clean_po_address(m.group(1))
-        m = re.search(r"Delivered\s+To\s*:.*?GST\s+No\.\s*:\s*([0-9A-Z]{15})", full_text, re.I|re.S)
-        if m: h["Ship to GST no as per PO"] = m.group(1).upper()
+        if ship:
+            h["Ship to GST no as per PO"] = ship.group(1).upper()
+            h["Ship to Location"] = _clean_po_address(
+                f"BLINK COMMERCE PRIVATE LIMITED {ship.group(2)}"
+            )
+        else:
+            # Alternate Blinkit layouts.
+            m = re.search(
+                r"Delivered\s+To\s*:\s*(.+?)(?=\s*GST\s+No\.\s*:)",
+                full_text, re.I | re.S
+            )
+            if m:
+                h["Ship to Location"] = _clean_po_address(m.group(1))
+
+            m = re.search(
+                r"Delivered\s+To\s*:.*?GST\s+No\.\s*:\s*([0-9A-Z]{15})",
+                full_text, re.I | re.S
+            )
+            if m:
+                h["Ship to GST no as per PO"] = m.group(1).upper()
+
+        # Last safeguard: preserve destination PIN from the Delivered-To block
+        # so Ship-to Location Master can resolve the code.
+        if not extract_pin_from_text(h.get("Ship to Location","")):
+            pin_match = re.search(
+                r"BLINK\s+COMMERCE\s+PRIVATE\s+LIMITED.*?\bTo\b.*?"
+                r"(?<!\d)(\d{6})(?!\d)",
+                flat_text,
+                re.I | re.S
+            )
+            if pin_match:
+                h["Ship to Location"] = _clean_po_address(
+                    f"{h.get('Ship to Location','BLINK COMMERCE PRIVATE LIMITED')} "
+                    f"PIN {pin_match.group(1)}"
+                )
 
     elif "SCOOTSY" in p:
         m = re.search(r"PO\s+No\s*:\s*([A-Z0-9-]+)", full_text, re.I)
@@ -2621,32 +2696,37 @@ def parse_customer_po_pdf_by_mapping(raw, source_file, upload_id):
                 values = _pdf_row_values_from_mapping(row, line_maps)
 
                 if "BLINK" in profile.upper():
-                    # Blinkit Recommended Quantity Order (R.O.) fixed commercial fields.
-                    # Current Blinkit table:
-                    #   Tax Amt | Landing Rate | Qty. | MRP | Total Amt
-                    # pdfplumber returns these at indexes 9,10,11,12,13.
+                    # Blinkit has two reviewed table structures:
                     #
-                    # IMPORTANT FOR B2B:
-                    # Use the PO Landing Rate itself as Unit Price. Do NOT divide by GST.
-                    # This is also the value maintained in Customer SKU & Price Master.
-                    if len(row) >= 14:
-                        landing_rate = number_value(row[10])
-                        blink_qty = number_value(row[11])
-                        blink_total = number_value(row[13])
+                    # 13 columns (IGST layout):
+                    #   ... Tax Amt[8] | Landing Rate[9] | Qty[10] | MRP[11] | Total[12]
+                    #
+                    # 14 columns (CGST/SGST layout):
+                    #   ... Tax Amt[9] | Landing Rate[10] | Qty[11] | MRP[12] | Total[13]
+                    #
+                    # Use Landing Rate as B2B Unit Price and never MRP.
+                    if len(row) >= 13:
+                        if len(row) == 13:
+                            landing_idx, qty_idx, total_idx = 9, 10, 12
+                        else:
+                            landing_idx, qty_idx, total_idx = 10, 11, 13
 
-                        # Accept only a commercially consistent Blinkit row.
+                        landing_rate = number_value(row[landing_idx])
+                        blink_qty = number_value(row[qty_idx])
+                        blink_total = number_value(row[total_idx])
+
                         expected_total = landing_rate * blink_qty
                         total_ok = (
                             blink_total <= 0
-                            or abs(expected_total - blink_total) <= max(1.0, abs(blink_total) * 0.001)
+                            or abs(expected_total - blink_total)
+                            <= max(1.0, abs(blink_total) * 0.001)
                         )
+
                         if landing_rate > 0 and blink_qty > 0 and total_ok:
                             values["PO Qty"] = blink_qty
                             values["PO Unit Price"] = landing_rate
                             values["PO Value"] = blink_total
                         else:
-                            # Reject shifted/malformed numeric columns instead of
-                            # silently staging a wrong quantity or price.
                             continue
 
                 if "METRO" in profile.upper() and len(row) >= 11:
@@ -4386,6 +4466,74 @@ def import_sales_orders(df):
         str(c_so),
         str(c_po),
     )
+
+
+def reprocess_stuck_sales_order_uploads():
+    """Reprocess Sales Order uploads left at Processing / 0 or Failed."""
+    stuck = read_sql(
+        """SELECT id,file_name,stored_path,status,rows_loaded
+           FROM uploads
+           WHERE UPPER(TRIM(COALESCE(source_type,'')))='SALES ORDERS'
+             AND (
+                 UPPER(TRIM(COALESCE(status,''))) LIKE 'PROCESSING%'
+                 OR UPPER(TRIM(COALESCE(status,''))) LIKE 'FAILED%'
+                 OR COALESCE(rows_loaded,0)=0
+             )
+           ORDER BY id"""
+    )
+
+    if stuck.empty:
+        return {"files": 0, "rows": 0, "po_mappings": 0, "errors": []}
+
+    repaired_files = 0
+    total_rows = 0
+    total_po = 0
+    errors = []
+
+    for _, u in stuck.iterrows():
+        uid = int(u["id"])
+        file_name = text_value(u.get("file_name")) or "Sales Orders.xlsx"
+
+        try:
+            p = materialize_upload_if_missing(
+                uid,
+                text_value(u.get("stored_path")),
+                file_name
+            )
+            if not p or not Path(p).exists():
+                raise FileNotFoundError("stored source file is unavailable")
+
+            raw = Path(p).read_bytes()
+            df = read_excel(raw)
+
+            so_loaded, po_mapped, skipped, so_col, po_col = import_sales_orders(df)
+
+            update_upload(
+                uid,
+                f"Processed - {so_loaded} SO rows | {po_mapped} PO mappings",
+                so_loaded
+            )
+
+            repaired_files += 1
+            total_rows += so_loaded
+            total_po += po_mapped
+
+        except Exception as e:
+            try:
+                update_upload(uid, f"Failed - {text_value(e)[:180]}", 0)
+            except Exception:
+                pass
+            errors.append(f"{file_name}: {e}")
+
+    invalidate_dashboard_cache()
+
+    return {
+        "files": repaired_files,
+        "rows": total_rows,
+        "po_mappings": total_po,
+        "errors": errors,
+    }
+
 
 # =========================================================
 # BLOCKED SHIPMENT IMPORT
@@ -9064,9 +9212,9 @@ full_name = text_value(st.session_state.get("auth_full_name"))
 
 with st.sidebar:
     st.caption(
-        "Database: Supabase PostgreSQL • V63.43 LOGIN DEPENDENCY ORDER FIX"
+        "Database: Supabase PostgreSQL • V63.45 SALES ORDER STUCK REPROCESS FIX"
         if USE_POSTGRES else
-        "Database: Local SQLite • V63.43 LOGIN DEPENDENCY ORDER FIX"
+        "Database: Local SQLite • V63.45 SALES ORDER STUCK REPROCESS FIX"
     )
     st.markdown("## Control Tower")
 
@@ -9078,10 +9226,9 @@ with st.sidebar:
         "Customer SKU & Price Master",
         "User Working Summary",
         "Upload Centre",
-        "Audit / Exceptions",
     ]
     if role == "Admin":
-        nav_pages.append("User Management")
+        nav_pages.extend(["Audit / Exceptions", "User Management"])
 
     page = st.radio("Navigation", nav_pages, label_visibility="collapsed")
 
@@ -9509,7 +9656,7 @@ if page == "Main Reconciliation Dashboard":
             "Only GRN working columns can be edited by the GRN / Returns, Logistics or Admin team."
         )
 
-        authorized_grn = role in ["GRN / Returns","Logistics","Admin"]
+        authorized_grn = True  # V63.44: every authenticated user may update GRN working fields
         disabled_cols = [c for c in data.columns if c not in GRN_EDIT_COLUMNS]
 
         # Real table search: only rows matching the search text remain visible.
@@ -10099,9 +10246,6 @@ elif page == "Sales & Return 360°":
 # MASTER
 # ---------------------------------------------------------
 elif page == "Customer SKU & Price Master":
-    if role != "Admin":
-        st.error("Admin access is required to edit the Customer SKU & Price Master.")
-        st.stop()
     st.subheader("Customer Item Code + ERP Item Code & Price Master")
     st.caption(
         "Search, filter, edit any master detail at row level, and download only the "
@@ -10563,9 +10707,6 @@ elif page == "User Working Summary":
 # UPLOAD CENTRE
 # ---------------------------------------------------------
 elif page == "Upload Centre":
-    if role == "Viewer":
-        st.error("Viewer accounts cannot upload or process source files.")
-        st.stop()
     st.subheader("Data Upload Centre")
     st.info(
         "Duplicate Protection ACTIVE: the same file/details will not be uploaded twice. "
@@ -10788,6 +10929,29 @@ elif page == "Upload Centre":
                 )
             except Exception as e:
                 st.warning(f"Could not preview Sales Order headers: {e}")
+        if st.button(
+            "Repair Stuck Sales Orders",
+            key="repair_stuck_sales_orders"
+        ):
+            with st.spinner("Reprocessing stored Sales Order file(s)..."):
+                result = reprocess_stuck_sales_order_uploads()
+
+            if result["errors"]:
+                st.warning(
+                    f"Repaired {result['files']} file(s), {result['rows']} SO row(s). "
+                    f"{len(result['errors'])} file(s) still failed: "
+                    + " | ".join(result["errors"][:3])
+                )
+            elif result["files"]:
+                st.success(
+                    f"Repaired {result['files']} Sales Order file(s): "
+                    f"{result['rows']} SO row(s) loaded and "
+                    f"{result['po_mappings']} PO mapping(s) refreshed."
+                )
+                st.rerun()
+            else:
+                st.info("No stuck Sales Order upload was found.")
+
         if st.button("Process Sales Orders", type="primary"):
             if not files:
                 st.warning("Choose at least one Sales Order file.")
@@ -11470,6 +11634,9 @@ elif page == "User Management":
 # AUDIT / EXCEPTIONS
 # ---------------------------------------------------------
 elif page == "Audit / Exceptions":
+    if role != "Admin":
+        st.error("Only Admin can view user/change audit and exceptions.")
+        st.stop()
     st.subheader("Audit / Exceptions")
     st.caption("Database compatibility check is applied automatically when the app starts; older Control Tower schemas are migrated in place.")
     st.caption("Upload History records what was processed previously. Dashboard row counters come from the current live database tables.")
