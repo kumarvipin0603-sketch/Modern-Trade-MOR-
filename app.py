@@ -8756,7 +8756,7 @@ def user_working_summary(start_date=None, end_date=None):
 # UI
 # =========================================================
 with st.sidebar:
-    st.caption("Database: Supabase PostgreSQL • V63.38 SALES ORDER FORMAT SAFE FIX" if USE_POSTGRES else "Database: Local SQLite • V63.38 SALES ORDER FORMAT SAFE FIX")
+    st.caption("Database: Supabase PostgreSQL • V63.39 MASTER FULL EDIT + FILTER DOWNLOAD" if USE_POSTGRES else "Database: Local SQLite • V63.39 MASTER FULL EDIT + FILTER DOWNLOAD")
     st.markdown("## Control Tower")
     page = st.radio(
         "Navigation",
@@ -9779,7 +9779,10 @@ elif page == "Sales & Return 360°":
 # ---------------------------------------------------------
 elif page == "Customer SKU & Price Master":
     st.subheader("Customer Item Code + ERP Item Code & Price Master")
-    st.caption("Existing Ledger + Customer Item records are updated; new unique records are added.")
+    st.caption(
+        "Search, filter, edit any master detail at row level, and download only the "
+        "currently searched / filtered records."
+    )
 
     f = st.file_uploader(
         "Upload / Update Master Excel",
@@ -9792,7 +9795,9 @@ elif page == "Customer SKU & Price Master":
         else:
             try:
                 ins, upd, skip = import_master(read_excel(f.getvalue()), user)
+                invalidate_dashboard_cache()
                 st.success(f"{ins} added, {upd} updated, {skip} skipped.")
+                st.rerun()
             except Exception as e:
                 st.error(str(e))
 
@@ -9803,14 +9808,72 @@ elif page == "Customer SKU & Price Master":
            ORDER BY ledger_name,customer_item_code"""
     )
 
+    # -----------------------------------------------------
+    # SEARCH + FILTERS
+    # -----------------------------------------------------
     master_search = st.text_input(
-        "Filter SKU / Price Master Rows",
-        placeholder="Type anything — only matching row(s) will remain visible",
-        key="sku_price_master_search",
-        help="This is a true row filter. Unlike the grid's built-in magnifier, non-matching rows are removed from the table view."
+        "Search Master",
+        placeholder=(
+            "Search Customer No., Ledger, Customer Item Code, ERP Item Code, "
+            "Description, Price, EAN..."
+        ),
+        key="sku_master_true_search"
     ).strip()
 
+    filter_c1, filter_c2, filter_c3 = st.columns(3)
+
+    def _master_options(col_name):
+        if master.empty or col_name not in master.columns:
+            return []
+        return sorted(
+            x for x in master[col_name].fillna("").astype(str).str.strip().unique()
+            if x
+        )
+
+    with filter_c1:
+        ledger_filter = st.multiselect(
+            "Ledger Name",
+            options=_master_options("ledger_name"),
+            default=[],
+            placeholder="All Ledgers",
+            key="sku_master_ledger_filter"
+        )
+
+    with filter_c2:
+        customer_filter = st.multiselect(
+            "Customer No.",
+            options=_master_options("customer_no"),
+            default=[],
+            placeholder="All Customers",
+            key="sku_master_customer_filter"
+        )
+
+    with filter_c3:
+        erp_filter = st.multiselect(
+            "ERP Item Code",
+            options=_master_options("erp_item_code"),
+            default=[],
+            placeholder="All ERP Items",
+            key="sku_master_erp_filter"
+        )
+
     master_view = master.copy()
+
+    if ledger_filter:
+        master_view = master_view[
+            master_view["ledger_name"].fillna("").astype(str).isin(ledger_filter)
+        ].copy()
+
+    if customer_filter:
+        master_view = master_view[
+            master_view["customer_no"].fillna("").astype(str).isin(customer_filter)
+        ].copy()
+
+    if erp_filter:
+        master_view = master_view[
+            master_view["erp_item_code"].fillna("").astype(str).isin(erp_filter)
+        ].copy()
+
     if master_search and not master_view.empty:
         search_terms = [t for t in master_search.lower().split() if t]
         searchable = master_view.fillna("").astype(str).apply(
@@ -9824,17 +9887,24 @@ elif page == "Customer SKU & Price Master":
             row_mask &= term_mask
         master_view = master_view.loc[row_mask].copy()
 
-    if master_search:
+    filters_active = bool(
+        master_search or ledger_filter or customer_filter or erp_filter
+    )
+
+    if filters_active:
         st.caption(
-            f"Filtered result: {len(master_view):,} matching row(s) out of {len(master):,}. "
-            "Only matching rows are displayed. Price can be edited directly."
+            f"Showing {len(master_view):,} searched / filtered row(s) out of "
+            f"{len(master):,} total master row(s)."
         )
     else:
         st.caption(
             f"Showing all {len(master):,} master row(s). "
-            "Use the filter above to display only matching rows. Only the Price column is editable."
+            "Search or apply filters to narrow the table."
         )
 
+    # -----------------------------------------------------
+    # ROW-LEVEL FULL EDIT
+    # -----------------------------------------------------
     if master_view.empty:
         st.info("No matching master rows found.")
     else:
@@ -9848,83 +9918,192 @@ elif page == "Customer SKU & Price Master":
             width="stretch",
             hide_index=True,
             height=520,
-            disabled=[
-                c for c in editable_master.columns
-                if c != "price"
-            ],
+            disabled=["updated_at", "updated_by"],
             column_config={
+                "customer_no": st.column_config.TextColumn(
+                    "Customer No.",
+                    help="Editable customer / ledger number."
+                ),
+                "ledger_name": st.column_config.TextColumn(
+                    "Ledger Name",
+                    help="Editable ledger name."
+                ),
+                "customer_item_code": st.column_config.TextColumn(
+                    "Customer Item Code",
+                    help="Editable customer SKU / item code."
+                ),
+                "erp_item_code": st.column_config.TextColumn(
+                    "ERP Item Code",
+                    help="Editable Glen / ERP item code."
+                ),
+                "item_description": st.column_config.TextColumn(
+                    "Item Description",
+                    help="Editable item description."
+                ),
                 "price": st.column_config.NumberColumn(
-                    "price",
+                    "Price",
                     min_value=0.0,
                     step=0.01,
                     format="%.2f",
-                    help="Edit the item price directly in this row."
-                )
+                    help="Editable basic price; maintained to 2 decimal places."
+                ),
+                "ean": st.column_config.TextColumn(
+                    "EAN",
+                    help="Editable EAN / barcode."
+                ),
+                "updated_at": st.column_config.TextColumn(
+                    "Updated At",
+                    disabled=True
+                ),
+                "updated_by": st.column_config.TextColumn(
+                    "Updated By",
+                    disabled=True
+                ),
             },
-            key="sku_price_master_editor"
+            key="sku_master_full_editor"
+        )
+
+        st.caption(
+            "Editable fields: Customer No., Ledger Name, Customer Item Code, ERP Item Code, "
+            "Item Description, Price and EAN. Updated At / Updated By are system controlled."
         )
 
         if st.button(
-            "Save Price Changes",
+            "Save Master Changes",
             type="primary",
-            key="save_sku_master_price_changes"
+            key="save_full_sku_master_changes"
         ):
             changed = 0
             now_iso = datetime.now().isoformat(timespec="seconds")
             con = open_db()
+
             try:
-                original_by_key = {
-                    (
-                        text_value(r["ledger_name"]),
-                        text_value(r["customer_item_code"])
-                    ): number_value(r["price"])
-                    for _, r in editable_master.iterrows()
-                }
+                for pos, (_, new_row) in enumerate(edited_master.iterrows()):
+                    old_row = editable_master.iloc[pos]
 
-                for _, r in edited_master.iterrows():
-                    ledger_key = text_value(r.get("ledger_name"))
-                    customer_item_key = text_value(r.get("customer_item_code"))
-                    new_price = number_value(r.get("price"))
-                    old_price = original_by_key.get(
-                        (ledger_key, customer_item_key),
-                        new_price
-                    )
+                    old_ledger = text_value(old_row.get("ledger_name"))
+                    old_customer_item = text_value(old_row.get("customer_item_code"))
 
-                    if abs(new_price - old_price) > 0.000001:
-                        con.execute(
-                            """UPDATE sku_master
-                               SET price=?, updated_at=?, updated_by=?
-                               WHERE ledger_name=? AND customer_item_code=?""",
-                            (
-                                new_price,
-                                now_iso,
-                                user,
-                                ledger_key,
-                                customer_item_key
-                            )
+                    business_fields = [
+                        "customer_no",
+                        "ledger_name",
+                        "customer_item_code",
+                        "erp_item_code",
+                        "item_description",
+                        "price",
+                        "ean",
+                    ]
+
+                    row_changed = False
+                    for fld in business_fields:
+                        if fld == "price":
+                            old_val = round(number_value(old_row.get(fld)), 2)
+                            new_val = round(number_value(new_row.get(fld)), 2)
+                            if abs(old_val - new_val) > 0.000001:
+                                row_changed = True
+                                break
+                        else:
+                            if text_value(old_row.get(fld)) != text_value(new_row.get(fld)):
+                                row_changed = True
+                                break
+
+                    if not row_changed:
+                        continue
+
+                    new_customer_no = text_value(new_row.get("customer_no"))
+                    new_ledger = text_value(new_row.get("ledger_name"))
+                    new_customer_item = text_value(new_row.get("customer_item_code"))
+                    new_erp = text_value(new_row.get("erp_item_code"))
+                    new_desc = text_value(new_row.get("item_description"))
+                    new_price = round(number_value(new_row.get("price")), 2)
+                    new_ean = text_value(new_row.get("ean"))
+
+                    if not new_ledger or not new_customer_item:
+                        raise ValueError(
+                            "Ledger Name and Customer Item Code cannot be blank. "
+                            f"Please review row {pos + 1}."
                         )
-                        changed += 1
+
+                    con.execute(
+                        """UPDATE sku_master
+                           SET customer_no=?,
+                               ledger_name=?,
+                               customer_item_code=?,
+                               erp_item_code=?,
+                               item_description=?,
+                               price=?,
+                               ean=?,
+                               updated_at=?,
+                               updated_by=?
+                           WHERE ledger_name=? AND customer_item_code=?""",
+                        (
+                            new_customer_no,
+                            new_ledger,
+                            new_customer_item,
+                            new_erp,
+                            new_desc,
+                            new_price,
+                            new_ean,
+                            now_iso,
+                            user,
+                            old_ledger,
+                            old_customer_item,
+                        )
+                    )
+                    changed += 1
 
                 con.commit()
+            except Exception as e:
+                try:
+                    con.rollback()
+                except Exception:
+                    pass
+                st.error(
+                    "Master update failed. Please check for duplicate Ledger Name + "
+                    f"Customer Item Code combinations or invalid values. Details: {e}"
+                )
             finally:
                 con.close()
 
             if changed:
                 invalidate_dashboard_cache()
-                st.success(f"{changed} price row(s) updated successfully.")
+                st.success(f"{changed} master row(s) updated successfully.")
                 st.rerun()
-            else:
-                st.info("No price changes detected.")
+            elif "e" not in locals():
+                st.info("No master changes detected.")
 
-    if not master.empty:
+    # -----------------------------------------------------
+    # DOWNLOAD CURRENT SEARCHED / FILTERED VIEW ONLY
+    # -----------------------------------------------------
+    if not master_view.empty:
+        export_view = master_view.copy()
+
         out = io.BytesIO()
         with pd.ExcelWriter(out, engine="openpyxl") as writer:
-            master.to_excel(writer, index=False, sheet_name="Master")
+            export_view.to_excel(
+                writer,
+                index=False,
+                sheet_name="Filtered Master"
+            )
+            ws = writer.book["Filtered Master"]
+            ws.freeze_panes = "A2"
+            if "price" in export_view.columns:
+                price_col = list(export_view.columns).index("price") + 1
+                for row_idx in range(2, ws.max_row + 1):
+                    ws.cell(row=row_idx, column=price_col).number_format = "0.00"
+
+        download_label = (
+            f"Download Searched / Filtered Master ({len(export_view):,} rows)"
+            if filters_active
+            else f"Download Current Master ({len(export_view):,} rows)"
+        )
+
         st.download_button(
-            "Download Master Excel",
+            download_label,
             out.getvalue(),
-            "Customer_ERP_Item_Price_Master.xlsx",
-            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            "Customer_ERP_Item_Price_Master_Filtered.xlsx",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="download_filtered_sku_master"
         )
 
 # ---------------------------------------------------------
