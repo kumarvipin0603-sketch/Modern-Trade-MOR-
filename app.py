@@ -961,7 +961,6 @@ def require_authentication():
                 st.error("Invalid User ID / password, or the account is inactive.")
         st.stop()
 
-require_authentication()
 
 
 # Production database status and extra PostgreSQL indexes.
@@ -1190,6 +1189,11 @@ def read_sql(sql, params=()):
         return pd.read_sql_query(sql, con, params=params)
     finally:
         con.close()
+
+
+# Authentication starts only after database read helpers exist.
+
+require_authentication()
 
 def install_pdfplumber_dependency():
     """
@@ -9058,9 +9062,9 @@ full_name = text_value(st.session_state.get("auth_full_name"))
 
 with st.sidebar:
     st.caption(
-        "Database: Supabase PostgreSQL • V63.41 USER LOGIN + AUDIT"
+        "Database: Supabase PostgreSQL • V63.42 USER LOGIN ORDER FIX"
         if USE_POSTGRES else
-        "Database: Local SQLite • V63.41 USER LOGIN + AUDIT"
+        "Database: Local SQLite • V63.42 USER LOGIN ORDER FIX"
     )
     st.markdown("## Control Tower")
 
