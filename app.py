@@ -3351,6 +3351,11 @@ def canonical_ledger_name(value):
     ):
         return "ZEPTO"
 
+    # METRO has appeared in source files with both "Limited" and
+    # "Private Limited". Treat them as the same reconciliation customer.
+    if "METROCASHANDCARRYINDIA" in compact:
+        return "METROCASHANDCARRYINDIA"
+
     return compact
 
 
@@ -4520,9 +4525,8 @@ def _grn_insert_row(con, values, source_type):
         if erp and not text_value(values.get("Item Description")):
             values["Item Description"] = master_desc
 
-    # 3) Final conservative fallback: if same PO+invoice has exactly one ERP
-    # item in Sale Register, it is safe to use it. This is only for single-line
-    # invoices; multi-line invoices are intentionally left unresolved.
+    # 3) Sale Register fallback.
+    # First, if this is a single-line PO+invoice, the ERP is unambiguous.
     if not erp and po and invoice:
         sale_rows = con.execute(
             """SELECT DISTINCT erp_item_code
@@ -4539,6 +4543,49 @@ def _grn_insert_row(con, values, source_type):
         })
         if len(sale_erps) == 1:
             erp = sale_erps[0]
+
+    # 4) Multi-line GRN fallback: match by exact invoice quantity.
+    # This is required for customer GRNs such as METRO where the GRN Article
+    # number may not be the same identifier stored in the Customer PO master.
+    # We only accept the match when exactly ONE ERP item on that invoice has
+    # the same billed quantity, so no ambiguous item assignment is made.
+    if not erp and invoice:
+        match_qty = number_value(values.get("Invoice Qty"))
+        if match_qty <= 0:
+            match_qty = qty
+
+        if match_qty > 0:
+            if po:
+                qty_rows = con.execute(
+                    """SELECT erp_item_code,item_description,qty
+                       FROM sale_register
+                       WHERE UPPER(TRIM(COALESCE(po_no,'')))=UPPER(TRIM(?))
+                         AND UPPER(TRIM(COALESCE(invoice_no,'')))=UPPER(TRIM(?))
+                         AND TRIM(COALESCE(erp_item_code,''))<>''""",
+                    (po, invoice)
+                ).fetchall()
+            else:
+                qty_rows = con.execute(
+                    """SELECT erp_item_code,item_description,qty
+                       FROM sale_register
+                       WHERE UPPER(TRIM(COALESCE(invoice_no,'')))=UPPER(TRIM(?))
+                         AND TRIM(COALESCE(erp_item_code,''))<>''""",
+                    (invoice,)
+                ).fetchall()
+
+            qty_matches = {}
+            for rr in qty_rows:
+                rr_qty = number_value(rr[2])
+                if abs(rr_qty - match_qty) <= 0.000001:
+                    rr_erp = text_value(rr[0]).strip()
+                    if rr_erp:
+                        qty_matches[rr_erp.upper()] = rr
+
+            if len(qty_matches) == 1:
+                rr = next(iter(qty_matches.values()))
+                erp = text_value(rr[0]).strip()
+                if erp and not text_value(values.get("Item Description")):
+                    values["Item Description"] = text_value(rr[1])
 
     values["ERP Item Code"] = erp
     values["Customer Item Code"] = customer_item
@@ -6514,6 +6561,32 @@ def available_main_dashboard():
             grn.get("short_delivered", 0), errors="coerce"
         ).fillna(0)
 
+        # Dashboard-time repair for historical GRN rows that were loaded before
+        # the ERP-link fix. Resolve a blank ERP by exact invoice + unique quantity
+        # against Sale Register, without requiring the PDF to be uploaded again.
+        missing_erp = grn["erp_item_code_k"].fillna("").astype(str).str.strip().eq("")
+        if missing_erp.any() and not invoices.empty:
+            inv_qty_lookup = {}
+            for _, sr in invoices.iterrows():
+                inv_k = text_value(sr.get("invoice_no_k")).strip().upper()
+                po_k = text_value(sr.get("po_no_k")).strip().upper()
+                erp_k = text_value(sr.get("erp_item_code_k")).strip().upper()
+                sq = number_value(sr.get("qty"))
+                if inv_k and erp_k and sq > 0:
+                    inv_qty_lookup.setdefault((po_k, inv_k, round(sq, 6)), set()).add(erp_k)
+
+            for ix in grn.index[missing_erp]:
+                po_k = text_value(grn.at[ix, "po_no_k"]).strip().upper()
+                inv_k = text_value(grn.at[ix, "invoice_no_k"]).strip().upper()
+                gq = number_value(grn.at[ix, "invoice_qty"])
+                if gq <= 0:
+                    gq = number_value(grn.at[ix, "grn_qty"])
+                vals = inv_qty_lookup.get((po_k, inv_k, round(gq, 6)), set())
+                if len(vals) == 1:
+                    erp_val = next(iter(vals))
+                    grn.at[ix, "erp_item_code"] = erp_val
+                    grn.at[ix, "erp_item_code_k"] = erp_val
+
         # Ignore parser junk that cannot reconcile to a real ERP item.
         grn_valid = grn[
             grn["po_no_k"].fillna("").astype(str).str.strip().ne("") &
@@ -8374,7 +8447,7 @@ def user_working_summary(period_mode="Daily", selected_day=None, selected_month=
 # UI
 # =========================================================
 with st.sidebar:
-    st.caption("Database: Supabase PostgreSQL • V63.29 GRN METRO/WALMART FIX" if USE_POSTGRES else "Database: Local SQLite • V63.29 GRN METRO/WALMART FIX")
+    st.caption("Database: Supabase PostgreSQL • V63.30 GRN RECONCILIATION LINK FIX" if USE_POSTGRES else "Database: Local SQLite • V63.30 GRN RECONCILIATION LINK FIX")
     st.markdown("## Control Tower")
     page = st.radio(
         "Navigation",
