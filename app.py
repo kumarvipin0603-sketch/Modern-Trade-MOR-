@@ -7289,13 +7289,19 @@ def available_main_dashboard():
     out.loc[blank_status & po_qty_row.notna() & erp_present & pending_num.gt(0) & stock_num.lt(pending_num) & blocked_num.gt(0),"Remarks for complete billing"] = "Review blocked shipment / allocation"
     out.loc[blank_status & po_qty_row.notna() & erp_present & pending_num.gt(0) & stock_num.lt(pending_num) & blocked_num.le(0),"Remarks for complete billing"] = "FG stock shortage"
 
-    # One actual invoice/SKU line appears once.
-    visible_key = [
-        "Po Number","Po Item","Product/Item No","Invoice No","Invoice Date",
-        "Billed Qty","Po Qty","Po Value","Line Amount","CN /SR No","Shipment/Document No"
-    ]
-    helper = out[visible_key].fillna("").astype(str).apply(lambda s:s.str.strip().str.upper())
-    out = out.loc[~helper.duplicated(keep="first")].reset_index(drop=True)
+    # V63.35 ROW-INTEGRITY RULE:
+    # Do NOT de-duplicate Main Reconciliation invoice rows by displayed
+    # commercial fields. sale_register ingestion already protects against
+    # re-uploading the exact same source row through source_key/business_key.
+    #
+    # Two genuine ERP invoice rows can legitimately have the same PO, SKU,
+    # invoice, quantity and value. Collapsing on those visible fields was the
+    # reason some Sale Register invoice rows disappeared from reconciliation.
+    #
+    # Credit Memo / Sale Return rows are NOT appended separately here. They
+    # remain merged into the related Sale Invoice row through the existing
+    # CN / SR aggregation logic.
+    out = out.reset_index(drop=True)
 
     for col in MAIN_COLUMNS:
         if col not in out.columns:
@@ -8608,57 +8614,148 @@ def b2b_order_staging_excel_bytes(df):
 
 
 
-@st.cache_data(show_spinner=False, ttl=120, max_entries=4)
-def user_working_summary(period_mode="Daily", selected_day=None, selected_month=None):
-    so = read_sql("""SELECT erp_sales_order_no,user_id,created_date
-                     FROM sales_order_map
-                     WHERE TRIM(COALESCE(erp_sales_order_no,''))<>''""")
-    inv = read_sql("""SELECT invoice_no,invoice_date,user_id,gross_amount,document_type
-                      FROM sale_register
-                      WHERE TRIM(COALESCE(invoice_no,''))<>''""")
+@st.cache_data(show_spinner=False, ttl=120, max_entries=8)
+def user_working_summary(start_date=None, end_date=None):
+    """
+    Billing productivity by Sales Order creation date and Billing ID.
 
-    if selected_day is None:
-        selected_day = datetime.now().date()
-    day_str = pd.Timestamp(selected_day).strftime("%Y-%m-%d")
-    month_str = str(selected_month or pd.Timestamp(selected_day).strftime("%Y-%m"))
+    Cohort logic:
+      - Date = sales_order_map.created_date
+      - Billing ID = sales_order_map.user_id
+      - Sales Orders = unique ERP SOs created by that Billing ID on that date
+      - Billed Sales Orders = those SOs having at least one Sale Invoice
+      - Sale Invoices = unique invoice numbers against those SOs
+      - Invoice Value = sum of invoice gross amount against those SOs
 
-    if not so.empty:
-        so["created_date"] = so["created_date"].fillna("").astype(str).str[:10]
-        so["user_id"] = so["user_id"].fillna("").astype(str).str.strip()
-        so = so[so["user_id"] != ""].copy()
-        if period_mode == "Daily":
-            so = so[so["created_date"] == day_str].copy()
-        else:
-            so = so[so["created_date"].str[:7] == month_str].copy()
+    Credit Memo / Sale Return rows are excluded from invoice counts/value.
+    """
+    so = read_sql(
+        """SELECT po_no,erp_sales_order_no,user_id,created_date
+           FROM sales_order_map
+           WHERE TRIM(COALESCE(erp_sales_order_no,''))<>''"""
+    )
 
-    if not inv.empty:
-        inv["invoice_date"] = inv["invoice_date"].fillna("").astype(str).str[:10]
-        inv["user_id"] = inv["user_id"].fillna("").astype(str).str.strip()
-        inv["gross_amount"] = pd.to_numeric(inv["gross_amount"], errors="coerce").fillna(0)
+    inv = read_sql(
+        """SELECT sales_order_no,invoice_no,invoice_date,gross_amount,document_type
+           FROM sale_register
+           WHERE TRIM(COALESCE(invoice_no,''))<>''"""
+    )
+
+    if start_date is None:
+        start_date = datetime.now().date()
+    if end_date is None:
+        end_date = start_date
+
+    start_ts = pd.Timestamp(start_date).normalize()
+    end_ts = pd.Timestamp(end_date).normalize()
+
+    if so.empty:
+        return pd.DataFrame(columns=[
+            "Date","Billing ID","Sales Orders","Billed Sales Orders",
+            "Pending Sales Orders","Sale Invoices","Invoice Value"
+        ])
+
+    so = so.copy()
+    so["Billing ID"] = so["user_id"].fillna("").astype(str).str.strip()
+    so["Sales Order No"] = so["erp_sales_order_no"].fillna("").astype(str).str.strip()
+    so["SO_K"] = so["Sales Order No"].str.upper()
+    so["Date_dt"] = pd.to_datetime(
+        so["created_date"].fillna("").astype(str).str[:10],
+        errors="coerce"
+    ).dt.normalize()
+
+    so = so[
+        so["Billing ID"].ne("")
+        & so["Sales Order No"].ne("")
+        & so["Date_dt"].notna()
+        & so["Date_dt"].between(start_ts, end_ts)
+    ].copy()
+
+    if so.empty:
+        return pd.DataFrame(columns=[
+            "Date","Billing ID","Sales Orders","Billed Sales Orders",
+            "Pending Sales Orders","Sale Invoices","Invoice Value"
+        ])
+
+    # Keep one SO once per Billing ID/date. This protects the productivity
+    # count even if the same SO appears repeatedly in a source upload.
+    so = so.drop_duplicates(["Date_dt","Billing ID","SO_K"], keep="last")
+
+    if inv.empty:
+        inv_agg = pd.DataFrame(columns=["SO_K","Sale Invoices","Invoice Value"])
+    else:
+        inv = inv.copy()
+        inv["SO_K"] = inv["sales_order_no"].fillna("").astype(str).str.strip().str.upper()
+        inv["Invoice No K"] = inv["invoice_no"].fillna("").astype(str).str.strip().str.upper()
+        inv["gross_amount"] = pd.to_numeric(inv["gross_amount"], errors="coerce").fillna(0.0)
+
         doc = inv["document_type"].fillna("").astype(str).str.strip().str.upper()
-        inv = inv[(inv["user_id"] != "") & ((doc == "INVOICE") | (doc == ""))].copy()
-        if period_mode == "Daily":
-            inv = inv[inv["invoice_date"] == day_str].copy()
-        else:
-            inv = inv[inv["invoice_date"].str[:7] == month_str].copy()
+        inv = inv[
+            inv["SO_K"].ne("")
+            & inv["Invoice No K"].ne("")
+            & ((doc == "INVOICE") | (doc == ""))
+        ].copy()
 
-    so_g = so.groupby("user_id")["erp_sales_order_no"].nunique() if not so.empty else pd.Series(dtype="int64")
-    inv_g = inv.groupby("user_id")["invoice_no"].nunique() if not inv.empty else pd.Series(dtype="int64")
-    val_g = inv.groupby("user_id")["gross_amount"].sum() if not inv.empty else pd.Series(dtype="float64")
-    users = sorted(set(so_g.index) | set(inv_g.index) | set(val_g.index))
-    return pd.DataFrame([
-        {"User ID":u,
-         "Sales Orders":int(so_g.get(u,0)),
-         "Invoices":int(inv_g.get(u,0)),
-         "Invoice Value":float(val_g.get(u,0.0))}
-        for u in users
-    ], columns=["User ID","Sales Orders","Invoices","Invoice Value"])
+        if inv.empty:
+            inv_agg = pd.DataFrame(columns=["SO_K","Sale Invoices","Invoice Value"])
+        else:
+            # Invoice count is distinct invoice number per SO.
+            invoice_counts = (
+                inv.groupby("SO_K")["Invoice No K"]
+                .nunique()
+                .rename("Sale Invoices")
+            )
+            invoice_values = (
+                inv.groupby("SO_K")["gross_amount"]
+                .sum()
+                .rename("Invoice Value")
+            )
+            inv_agg = pd.concat([invoice_counts, invoice_values], axis=1).reset_index()
+
+    detail = so.merge(inv_agg, on="SO_K", how="left")
+    detail["Sale Invoices"] = pd.to_numeric(
+        detail["Sale Invoices"], errors="coerce"
+    ).fillna(0).astype(int)
+    detail["Invoice Value"] = pd.to_numeric(
+        detail["Invoice Value"], errors="coerce"
+    ).fillna(0.0)
+    detail["Billed Flag"] = detail["Sale Invoices"].gt(0).astype(int)
+
+    daily = (
+        detail.groupby(["Date_dt","Billing ID"], as_index=False)
+        .agg(
+            Sales_Orders=("SO_K","nunique"),
+            Billed_Sales_Orders=("Billed Flag","sum"),
+            Sale_Invoices=("Sale Invoices","sum"),
+            Invoice_Value=("Invoice Value","sum"),
+        )
+    )
+
+    daily["Pending_Sales_Orders"] = (
+        daily["Sales_Orders"] - daily["Billed_Sales_Orders"]
+    ).clip(lower=0)
+
+    daily = daily.rename(columns={
+        "Date_dt":"Date",
+        "Sales_Orders":"Sales Orders",
+        "Billed_Sales_Orders":"Billed Sales Orders",
+        "Pending_Sales_Orders":"Pending Sales Orders",
+        "Sale_Invoices":"Sale Invoices",
+        "Invoice_Value":"Invoice Value",
+    })
+
+    daily["Date"] = pd.to_datetime(daily["Date"]).dt.strftime("%Y-%m-%d")
+
+    return daily[[
+        "Date","Billing ID","Sales Orders","Billed Sales Orders",
+        "Pending Sales Orders","Sale Invoices","Invoice Value"
+    ]].sort_values(["Date","Billing ID"], ascending=[True, True]).reset_index(drop=True)
 
 # =========================================================
 # UI
 # =========================================================
 with st.sidebar:
-    st.caption("Database: Supabase PostgreSQL • V63.33 GRN REPROCESS + PARSER FIX" if USE_POSTGRES else "Database: Local SQLite • V63.33 GRN REPROCESS + PARSER FIX")
+    st.caption("Database: Supabase PostgreSQL • V63.36 BILLING PRODUCTIVITY DASHBOARD" if USE_POSTGRES else "Database: Local SQLite • V63.36 BILLING PRODUCTIVITY DASHBOARD")
     st.markdown("## Control Tower")
     page = st.radio(
         "Navigation",
@@ -8928,6 +9025,26 @@ if page == "Main Reconciliation Dashboard":
             st.info(f"Showing only rows with Pending Billing Qty > 0 across all ledgers.")
         else:
             st.info(f"Showing only rows with Pending Billing Qty > 0 for ledger: {selected_ledger}")
+
+    # V63.35 reconciliation control totals.
+    # Total Sale Register rows are not expected to equal visible reconciliation
+    # invoice rows because Credit Memo / Sale Return rows are merged into their
+    # related invoice rows rather than shown as separate rows.
+    try:
+        _sr_audit = cached_table("sale_register").copy()
+        _audit_sale, _audit_return = sale_return_masks(_sr_audit)
+        _source_total = len(_sr_audit)
+        _source_invoices = int(_audit_sale.sum())
+        _source_returns = int(_audit_return.sum())
+        st.caption(
+            f"Sale Register control: {_source_total:,} source row(s) = "
+            f"{_source_invoices:,} Sale Invoice row(s) + "
+            f"{_source_returns:,} Credit Memo / Sale Return row(s). "
+            "Returns are merged into the related Sale Invoice row and are not "
+            "shown as separate reconciliation rows."
+        )
+    except Exception:
+        pass
 
     quality = sale_register_quality()
     if quality.get("total_rows",0) and (
@@ -9813,37 +9930,106 @@ elif page == "Customer SKU & Price Master":
 # USER WORKING SUMMARY
 # ---------------------------------------------------------
 elif page == "User Working Summary":
-    st.subheader("User Working Summary")
-    st.caption("Unique Sales Orders | Unique Invoices | Sum of Invoice Gross Amount by User ID")
+    st.subheader("Billing Productivity Summary")
+    st.caption(
+        "Daily Billing-ID wise productivity: Sales Orders created, how many Sales Orders "
+        "have been billed, Sale Invoice count and total Invoice Value."
+    )
 
-    c1, c2 = st.columns([1,2])
-    with c1:
-        period_mode = st.radio("Period", ["Daily","Monthly"], horizontal=True)
+    today = datetime.now().date()
+    default_start = today.replace(day=1)
 
-    if period_mode == "Daily":
-        with c2:
-            selected_work_date = st.date_input("Working Date", value=datetime.now().date())
-        summary = user_working_summary("Daily", selected_day=selected_work_date)
+    d1, d2 = st.columns(2)
+    with d1:
+        work_start_date = st.date_input(
+            "From Date",
+            value=default_start,
+            key="billing_summary_from_date"
+        )
+    with d2:
+        work_end_date = st.date_input(
+            "To Date",
+            value=today,
+            key="billing_summary_to_date"
+        )
+
+    if work_start_date > work_end_date:
+        st.error("From Date cannot be after To Date.")
+        summary = pd.DataFrame()
     else:
-        with c2:
-            selected_work_month = st.text_input(
-                "Month (YYYY-MM)", value=datetime.now().strftime("%Y-%m")
-            ).strip()
-        summary = user_working_summary("Monthly", selected_month=selected_work_month)
+        summary = user_working_summary(work_start_date, work_end_date)
 
     if summary.empty:
         st.info(
-            "No user-wise work found. Re-upload the Sales Order file and Sale Register once "
-            "after V63.15 so User ID is stored."
+            "No Billing-ID wise Sales Order activity found for the selected date range."
         )
     else:
-        k1,k2,k3 = st.columns(3)
-        k1.metric("Sales Orders", f"{int(summary['Sales Orders'].sum()):,}")
-        k2.metric("Invoices", f"{int(summary['Invoices'].sum()):,}")
-        k3.metric("Invoice Value", f"₹{float(summary['Invoice Value'].sum()):,.2f}")
-        show = summary.copy()
-        show["Invoice Value"] = show["Invoice Value"].map(lambda x: f"{x:,.2f}")
-        st.dataframe(show, width="stretch", hide_index=True)
+        # Optional Billing ID filter.
+        billing_ids = sorted(
+            x for x in summary["Billing ID"].dropna().astype(str).unique()
+            if x.strip()
+        )
+        selected_billing_ids = st.multiselect(
+            "Billing ID",
+            options=billing_ids,
+            default=[],
+            placeholder="All Billing IDs",
+            key="billing_productivity_id_filter"
+        )
+
+        view = summary.copy()
+        if selected_billing_ids:
+            view = view[view["Billing ID"].isin(selected_billing_ids)].copy()
+
+        k1, k2, k3, k4, k5 = st.columns(5)
+        k1.metric("Sales Orders", f"{int(view['Sales Orders'].sum()):,}")
+        k2.metric("Billed Sales Orders", f"{int(view['Billed Sales Orders'].sum()):,}")
+        k3.metric("Pending Sales Orders", f"{int(view['Pending Sales Orders'].sum()):,}")
+        k4.metric("Sale Invoices", f"{int(view['Sale Invoices'].sum()):,}")
+        k5.metric("Invoice Value", f"₹{float(view['Invoice Value'].sum()):,.2f}")
+
+        st.caption(
+            "Billed Sales Orders = Sales Orders having at least one Sale Invoice. "
+            "Credit Memo / Sale Return rows are excluded from Sale Invoice count and value."
+        )
+
+        show = view.copy()
+        st.dataframe(
+            show,
+            width="stretch",
+            hide_index=True,
+            height=min(650, 75 + min(len(show), 18) * 34),
+            column_config={
+                "Invoice Value": st.column_config.NumberColumn(
+                    "Invoice Value",
+                    format="₹ %.2f"
+                )
+            }
+        )
+
+        # Daily totals across all selected Billing IDs.
+        st.markdown("#### Daily Total")
+        daily_total = (
+            view.groupby("Date", as_index=False)
+            .agg({
+                "Sales Orders":"sum",
+                "Billed Sales Orders":"sum",
+                "Pending Sales Orders":"sum",
+                "Sale Invoices":"sum",
+                "Invoice Value":"sum",
+            })
+        )
+        st.dataframe(
+            daily_total,
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "Invoice Value": st.column_config.NumberColumn(
+                    "Invoice Value",
+                    format="₹ %.2f"
+                )
+            }
+        )
 
 # ---------------------------------------------------------
 # UPLOAD CENTRE
