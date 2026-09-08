@@ -1193,8 +1193,6 @@ def read_sql(sql, params=()):
 
 # Authentication starts only after database read helpers exist.
 
-require_authentication()
-
 def install_pdfplumber_dependency():
     """
     One-click local dependency installer for Windows/local Streamlit use.
@@ -1293,6 +1291,10 @@ def number_value(v):
         return float(str(v).replace(",", "").strip())
     except Exception:
         return 0.0
+
+
+# Start authentication only after all required DB/text helpers are defined.
+require_authentication()
 
 def date_value(v):
     if text_value(v) == "":
@@ -9062,9 +9064,9 @@ full_name = text_value(st.session_state.get("auth_full_name"))
 
 with st.sidebar:
     st.caption(
-        "Database: Supabase PostgreSQL • V63.42 USER LOGIN ORDER FIX"
+        "Database: Supabase PostgreSQL • V63.43 LOGIN DEPENDENCY ORDER FIX"
         if USE_POSTGRES else
-        "Database: Local SQLite • V63.42 USER LOGIN ORDER FIX"
+        "Database: Local SQLite • V63.43 LOGIN DEPENDENCY ORDER FIX"
     )
     st.markdown("## Control Tower")
 
