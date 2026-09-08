@@ -4423,40 +4423,73 @@ def import_sales_orders(df):
     if not detail_rows:
         raise ValueError("No valid ERP Sales Order rows were found in the file.")
 
-    con = open_db()
-    try:
-        # Preserve every unique ERP Sales Order for Billing Productivity.
-        con.executemany(
-            """INSERT INTO sales_order_detail(
-                   erp_sales_order_no,po_no,ledger_name,user_id,created_date,updated_at
-               ) VALUES(?,?,?,?,?,?)
-               ON CONFLICT(erp_sales_order_no) DO UPDATE SET
-                   po_no=excluded.po_no,
-                   ledger_name=excluded.ledger_name,
-                   user_id=excluded.user_id,
-                   created_date=excluded.created_date,
-                   updated_at=excluded.updated_at""",
-            detail_rows
+    # PostgreSQL/Supabase: use execute_values bulk upsert. The previous
+    # executemany path issued thousands of database executions and could sit
+    # on Streamlit's spinner for a very long time.
+    if USE_POSTGRES:
+        detail_df = pd.DataFrame(
+            detail_rows,
+            columns=[
+                "erp_sales_order_no","po_no","ledger_name",
+                "user_id","created_date","updated_at"
+            ]
+        )
+        pg_insert_dataframe(
+            detail_df,
+            "sales_order_detail",
+            conflict="update",
+            conflict_column="erp_sales_order_no",
+            page_size=2000
         )
 
-        # Keep legacy PO -> SO map for Main Reconciliation.
         if mapping_by_po:
+            map_df = pd.DataFrame(
+                list(mapping_by_po.values()),
+                columns=[
+                    "po_no","erp_sales_order_no","ledger_name",
+                    "user_id","created_date","updated_at"
+                ]
+            )
+            pg_insert_dataframe(
+                map_df,
+                "sales_order_map",
+                conflict="update",
+                conflict_column="po_no",
+                page_size=2000
+            )
+    else:
+        con = open_db()
+        try:
             con.executemany(
-                """INSERT INTO sales_order_map(
-                       po_no,erp_sales_order_no,ledger_name,user_id,created_date,updated_at
+                """INSERT INTO sales_order_detail(
+                       erp_sales_order_no,po_no,ledger_name,user_id,created_date,updated_at
                    ) VALUES(?,?,?,?,?,?)
-                   ON CONFLICT(po_no) DO UPDATE SET
-                       erp_sales_order_no=excluded.erp_sales_order_no,
+                   ON CONFLICT(erp_sales_order_no) DO UPDATE SET
+                       po_no=excluded.po_no,
                        ledger_name=excluded.ledger_name,
                        user_id=excluded.user_id,
                        created_date=excluded.created_date,
                        updated_at=excluded.updated_at""",
-                list(mapping_by_po.values())
+                detail_rows
             )
 
-        con.commit()
-    finally:
-        con.close()
+            if mapping_by_po:
+                con.executemany(
+                    """INSERT INTO sales_order_map(
+                           po_no,erp_sales_order_no,ledger_name,user_id,created_date,updated_at
+                       ) VALUES(?,?,?,?,?,?)
+                       ON CONFLICT(po_no) DO UPDATE SET
+                           erp_sales_order_no=excluded.erp_sales_order_no,
+                           ledger_name=excluded.ledger_name,
+                           user_id=excluded.user_id,
+                           created_date=excluded.created_date,
+                           updated_at=excluded.updated_at""",
+                    list(mapping_by_po.values())
+                )
+
+            con.commit()
+        finally:
+            con.close()
 
     invalidate_dashboard_cache()
     return (
@@ -4479,7 +4512,8 @@ def reprocess_stuck_sales_order_uploads():
                  OR UPPER(TRIM(COALESCE(status,''))) LIKE 'FAILED%'
                  OR COALESCE(rows_loaded,0)=0
              )
-           ORDER BY id"""
+           ORDER BY id DESC
+           LIMIT 1"""
     )
 
     if stuck.empty:
@@ -9212,9 +9246,9 @@ full_name = text_value(st.session_state.get("auth_full_name"))
 
 with st.sidebar:
     st.caption(
-        "Database: Supabase PostgreSQL • V63.45 SALES ORDER STUCK REPROCESS FIX"
+        "Database: Supabase PostgreSQL • V63.46 SALES ORDER FAST POSTGRES FIX"
         if USE_POSTGRES else
-        "Database: Local SQLite • V63.45 SALES ORDER STUCK REPROCESS FIX"
+        "Database: Local SQLite • V63.46 SALES ORDER FAST POSTGRES FIX"
     )
     st.markdown("## Control Tower")
 
@@ -10930,7 +10964,7 @@ elif page == "Upload Centre":
             except Exception as e:
                 st.warning(f"Could not preview Sales Order headers: {e}")
         if st.button(
-            "Repair Stuck Sales Orders",
+            "Repair Latest Stuck Sales Order",
             key="repair_stuck_sales_orders"
         ):
             with st.spinner("Reprocessing stored Sales Order file(s)..."):
