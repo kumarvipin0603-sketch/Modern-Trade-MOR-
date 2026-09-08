@@ -6567,9 +6567,9 @@ def available_main_dashboard():
         # Do not keep the missing-ERP mask in a branch-scoped variable.
         # Recompute it explicitly so the dashboard cannot fail with NameError
         # when a particular GRN/PO mapping branch is empty.
-        if not invoices.empty:
+        if not inv.empty:
             inv_qty_lookup = {}
-            for _, sr in invoices.iterrows():
+            for _, sr in inv.iterrows():
                 inv_k = text_value(sr.get("invoice_no_k")).strip().upper()
                 po_k = text_value(sr.get("po_no_k")).strip().upper()
                 erp_k = text_value(sr.get("erp_item_code_k")).strip().upper()
@@ -8464,7 +8464,7 @@ def user_working_summary(period_mode="Daily", selected_day=None, selected_month=
 # UI
 # =========================================================
 with st.sidebar:
-    st.caption("Database: Supabase PostgreSQL • V63.31 GRN DASHBOARD ERROR FIX" if USE_POSTGRES else "Database: Local SQLite • V63.31 GRN DASHBOARD ERROR FIX")
+    st.caption("Database: Supabase PostgreSQL • V63.32 GRN DASHBOARD INV FIX" if USE_POSTGRES else "Database: Local SQLite • V63.32 GRN DASHBOARD INV FIX")
     st.markdown("## Control Tower")
     page = st.radio(
         "Navigation",
