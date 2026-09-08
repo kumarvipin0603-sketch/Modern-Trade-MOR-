@@ -4861,6 +4861,52 @@ def parse_grn_pdf_by_mapping(raw):
                     if row_idx < start_idx or not row:
                         continue
 
+                    # METRO GRN PDFs can pack all item values into a single
+                    # pdfplumber table row, e.g. Article="494...\\n493...\\n..."
+                    # and Received Qty="3\\n30\\n12\\n25". Expand that
+                    # physical PDF row into one normalized GRN row per item.
+                    profile_u = text_value(profile).upper()
+                    if "METRO" in profile_u:
+                        def _metro_parts(col_idx):
+                            if not (0 <= col_idx < len(row)):
+                                return []
+                            return [
+                                text_value(x).strip()
+                                for x in re.split(r"[\\r\\n]+", text_value(row[col_idx]))
+                                if text_value(x).strip()
+                            ]
+
+                        article_parts = _metro_parts(1)
+                        challan_parts = _metro_parts(4)
+                        received_parts = _metro_parts(5)
+
+                        if (
+                            len(article_parts) > 1
+                            and len(received_parts) == len(article_parts)
+                        ):
+                            for metro_i, article in enumerate(article_parts):
+                                values = dict(header)
+                                values["Customer Item Code"] = article
+                                values["Invoice Qty"] = (
+                                    number_value(challan_parts[metro_i])
+                                    if metro_i < len(challan_parts) else 0
+                                )
+                                values["GRN Qty"] = number_value(received_parts[metro_i])
+
+                                if _grn_insert_row(
+                                    con, values, f"Mapping PDF:{profile}"
+                                ):
+                                    added += 1
+                                else:
+                                    duplicates += 1
+
+                                preview = dict(values)
+                                preview["Profile"] = profile
+                                preview["PDF Table"] = table_no
+                                preview["Table Row"] = row_idx
+                                parsed.append(preview)
+                            continue
+
                     values = dict(header)
                     any_line_value = False
                     for field, m in line_maps.items():
@@ -8328,7 +8374,7 @@ def user_working_summary(period_mode="Daily", selected_day=None, selected_month=
 # UI
 # =========================================================
 with st.sidebar:
-    st.caption("Database: Supabase PostgreSQL • V63.28 B2B 2-DECIMAL PRICE" if USE_POSTGRES else "Database: Local SQLite • V63.28 B2B 2-DECIMAL PRICE")
+    st.caption("Database: Supabase PostgreSQL • V63.29 GRN METRO/WALMART FIX" if USE_POSTGRES else "Database: Local SQLite • V63.29 GRN METRO/WALMART FIX")
     st.markdown("## Control Tower")
     page = st.radio(
         "Navigation",
