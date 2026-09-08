@@ -1,6 +1,6 @@
 import streamlit as st
 import pandas as pd
-import sqlite3, io, hashlib, re, time, warnings, math, os
+import sqlite3, io, hashlib, re, time, warnings, math, os, hmac, json
 from dotenv import load_dotenv
 import psycopg2
 from psycopg2 import IntegrityError as PGIntegrityError
@@ -245,6 +245,33 @@ def init_db():
             file_hash TEXT,
             status TEXT,
             rows_loaded INTEGER DEFAULT 0
+        )""")
+
+        con.execute("""CREATE TABLE IF NOT EXISTS app_users(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT UNIQUE,
+            full_name TEXT,
+            password_hash TEXT,
+            password_salt TEXT,
+            role TEXT,
+            active INTEGER DEFAULT 1,
+            created_at TEXT,
+            created_by TEXT,
+            last_login TEXT,
+            updated_at TEXT
+        )""")
+
+        con.execute("""CREATE TABLE IF NOT EXISTS app_audit_log(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_time TEXT,
+            user_id TEXT,
+            role TEXT,
+            action TEXT,
+            module TEXT,
+            record_key TEXT,
+            before_value TEXT,
+            after_value TEXT,
+            details TEXT
         )""")
 
         con.execute("""CREATE TABLE IF NOT EXISTS sku_master(
@@ -580,6 +607,21 @@ def init_db():
             if column_name not in cols:
                 con.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_type}")
 
+        # Authentication / audit compatibility.
+        for col_name, col_type in [
+            ("full_name","TEXT"),("password_hash","TEXT"),("password_salt","TEXT"),
+            ("role","TEXT"),("active","INTEGER DEFAULT 1"),("created_at","TEXT"),
+            ("created_by","TEXT"),("last_login","TEXT"),("updated_at","TEXT"),
+        ]:
+            ensure_column("app_users", col_name, col_type)
+
+        for col_name, col_type in [
+            ("event_time","TEXT"),("user_id","TEXT"),("role","TEXT"),
+            ("action","TEXT"),("module","TEXT"),("record_key","TEXT"),
+            ("before_value","TEXT"),("after_value","TEXT"),("details","TEXT"),
+        ]:
+            ensure_column("app_audit_log", col_name, col_type)
+
         # uploads: V7/V8 used "path"; current code uses "stored_path".
         ensure_column("uploads", "stored_path", "TEXT")
         ensure_column("uploads", "file_blob", "BYTEA" if USE_POSTGRES else "BLOB")
@@ -742,6 +784,185 @@ def init_db():
         con.close()
 
 init_db()
+
+# =========================================================
+# AUTHENTICATION + USER AUDIT
+# =========================================================
+APP_ROLES = ["Viewer", "Billing", "Logistics", "GRN / Returns", "Admin"]
+
+def _password_hash(password, salt_hex=None):
+    salt = bytes.fromhex(salt_hex) if salt_hex else os.urandom(16)
+    digest = hashlib.pbkdf2_hmac(
+        "sha256", str(password).encode("utf-8"), salt, 240000
+    )
+    return digest.hex(), salt.hex()
+
+def verify_password(password, stored_hash, stored_salt):
+    try:
+        candidate, _ = _password_hash(password, stored_salt)
+        return hmac.compare_digest(candidate, text_value(stored_hash))
+    except Exception:
+        return False
+
+def audit_event_conn(
+    con, user_id, role, action, module,
+    record_key="", before_value="", after_value="", details=""
+):
+    con.execute(
+        """INSERT INTO app_audit_log(
+             event_time,user_id,role,action,module,record_key,
+             before_value,after_value,details
+           ) VALUES(?,?,?,?,?,?,?,?,?)""",
+        (
+            datetime.now().isoformat(timespec="seconds"),
+            text_value(user_id), text_value(role), text_value(action),
+            text_value(module), text_value(record_key),
+            text_value(before_value)[:5000], text_value(after_value)[:5000],
+            text_value(details)[:5000],
+        )
+    )
+
+def audit_event(
+    action, module, record_key="",
+    before_value="", after_value="", details="",
+    user_id=None, role=None
+):
+    con = open_db()
+    try:
+        audit_event_conn(
+            con,
+            user_id if user_id is not None else st.session_state.get("auth_user_id",""),
+            role if role is not None else st.session_state.get("auth_role",""),
+            action, module, record_key, before_value, after_value, details
+        )
+        con.commit()
+    finally:
+        con.close()
+
+def user_count():
+    d = read_sql("SELECT COUNT(*) AS n FROM app_users")
+    return int(d.iloc[0]["n"]) if not d.empty else 0
+
+def create_app_user(user_id, full_name, password, role, created_by):
+    uid = text_value(user_id).strip()
+    full_name = text_value(full_name).strip()
+    if not uid:
+        raise ValueError("User ID is required.")
+    if len(str(password)) < 8:
+        raise ValueError("Password must contain at least 8 characters.")
+    if role not in APP_ROLES:
+        raise ValueError("Invalid role.")
+
+    ph, salt = _password_hash(password)
+    now = datetime.now().isoformat(timespec="seconds")
+    con = open_db()
+    try:
+        if con.execute(
+            "SELECT 1 FROM app_users WHERE UPPER(TRIM(user_id))=UPPER(TRIM(?))",
+            (uid,)
+        ).fetchone():
+            raise ValueError("This User ID already exists.")
+
+        con.execute(
+            """INSERT INTO app_users(
+                 user_id,full_name,password_hash,password_salt,role,active,
+                 created_at,created_by,updated_at
+               ) VALUES(?,?,?,?,?,?,?,?,?)""",
+            (uid, full_name, ph, salt, role, 1, now, created_by, now)
+        )
+        audit_event_conn(
+            con, created_by, "Admin", "CREATE_USER", "User Management",
+            uid, "", f"Name={full_name}; Role={role}", "User account created"
+        )
+        con.commit()
+    finally:
+        con.close()
+
+def authenticate_user(user_id, password):
+    d = read_sql(
+        """SELECT user_id,full_name,password_hash,password_salt,role,active
+           FROM app_users
+           WHERE UPPER(TRIM(user_id))=UPPER(TRIM(?))
+           LIMIT 1""",
+        (text_value(user_id).strip(),)
+    )
+    if d.empty:
+        return None
+    r = d.iloc[0]
+    if int(number_value(r.get("active"))) != 1:
+        return None
+    if not verify_password(password, r.get("password_hash"), r.get("password_salt")):
+        return None
+
+    now = datetime.now().isoformat(timespec="seconds")
+    con = open_db()
+    try:
+        con.execute(
+            "UPDATE app_users SET last_login=?,updated_at=? WHERE user_id=?",
+            (now, now, text_value(r.get("user_id")))
+        )
+        audit_event_conn(
+            con, r.get("user_id"), r.get("role"),
+            "LOGIN", "Authentication", r.get("user_id"), "", "", "Successful login"
+        )
+        con.commit()
+    finally:
+        con.close()
+
+    return {
+        "user_id": text_value(r.get("user_id")),
+        "full_name": text_value(r.get("full_name")),
+        "role": text_value(r.get("role")),
+    }
+
+def require_authentication():
+    if user_count() == 0:
+        st.title("Control Tower — Initial Admin Setup")
+        st.info(
+            "Create the first Admin account. Passwords are stored as salted "
+            "PBKDF2 hashes and are never stored as plain text."
+        )
+        with st.form("initial_admin_setup"):
+            admin_id = st.text_input("Admin User ID")
+            admin_name = st.text_input("Admin Name")
+            p1 = st.text_input("Password", type="password")
+            p2 = st.text_input("Confirm Password", type="password")
+            ok = st.form_submit_button("Create Admin", type="primary")
+        if ok:
+            if p1 != p2:
+                st.error("Passwords do not match.")
+            else:
+                try:
+                    create_app_user(
+                        admin_id, admin_name, p1, "Admin", "SYSTEM_BOOTSTRAP"
+                    )
+                    st.success("Admin created. Please sign in.")
+                    st.rerun()
+                except Exception as e:
+                    st.error(str(e))
+        st.stop()
+
+    if not st.session_state.get("authenticated", False):
+        st.title("PO Fulfilment Control Tower")
+        st.subheader("Sign in")
+        with st.form("login_form"):
+            login_id = st.text_input("User ID")
+            login_pw = st.text_input("Password", type="password")
+            ok = st.form_submit_button("Sign in", type="primary")
+        if ok:
+            account = authenticate_user(login_id, login_pw)
+            if account:
+                st.session_state["authenticated"] = True
+                st.session_state["auth_user_id"] = account["user_id"]
+                st.session_state["auth_full_name"] = account["full_name"]
+                st.session_state["auth_role"] = account["role"]
+                st.rerun()
+            else:
+                st.error("Invalid User ID / password, or the account is inactive.")
+        st.stop()
+
+require_authentication()
+
 
 # Production database status and extra PostgreSQL indexes.
 @st.cache_resource(show_spinner=False)
@@ -1197,6 +1418,11 @@ def save_upload(source_type, f, user):
             )
         )
         uid = cur.lastrowid
+        audit_event_conn(
+            con, user, st.session_state.get("auth_role",""),
+            "UPLOAD_FILE", source_type, str(uid),
+            "", f"{f.name} | Processing", "New upload registered"
+        )
         con.commit()
         return raw, stored, uid, False
     finally:
@@ -1233,9 +1459,24 @@ def invalidate_dashboard_cache():
 def update_upload(uid, status, rows):
     con = open_db()
     try:
+        before = con.execute(
+            "SELECT status,rows_loaded,source_type,file_name FROM uploads WHERE id=?",
+            (uid,)
+        ).fetchone()
         con.execute(
             "UPDATE uploads SET status=?,rows_loaded=? WHERE id=?",
             (status, int(rows), uid)
+        )
+        audit_event_conn(
+            con,
+            st.session_state.get("auth_user_id",""),
+            st.session_state.get("auth_role",""),
+            "UPDATE_UPLOAD_STATUS",
+            text_value(before[2]) if before else "Upload",
+            str(uid),
+            f"status={before[0]}; rows={before[1]}" if before else "",
+            f"status={status}; rows={int(rows)}",
+            text_value(before[3]) if before else ""
         )
         con.commit()
     finally:
@@ -8811,29 +9052,47 @@ def user_working_summary(start_date=None, end_date=None):
 # =========================================================
 # UI
 # =========================================================
+user = text_value(st.session_state.get("auth_user_id"))
+role = text_value(st.session_state.get("auth_role"))
+full_name = text_value(st.session_state.get("auth_full_name"))
+
 with st.sidebar:
-    st.caption("Database: Supabase PostgreSQL • V63.40 SALES ORDER BULK UPLOAD FIX" if USE_POSTGRES else "Database: Local SQLite • V63.40 SALES ORDER BULK UPLOAD FIX")
+    st.caption(
+        "Database: Supabase PostgreSQL • V63.41 USER LOGIN + AUDIT"
+        if USE_POSTGRES else
+        "Database: Local SQLite • V63.41 USER LOGIN + AUDIT"
+    )
     st.markdown("## Control Tower")
-    page = st.radio(
-        "Navigation",
-        [
-            "Main Reconciliation Dashboard",
-            "B2B Order Staging",
-            "Factory Stock Requirement",
-            "Sales & Return 360°",
-            "Customer SKU & Price Master",
-            "User Working Summary",
-            "Upload Centre",
-            "Audit / Exceptions",
-        ],
-        label_visibility="collapsed"
-    )
+
+    nav_pages = [
+        "Main Reconciliation Dashboard",
+        "B2B Order Staging",
+        "Factory Stock Requirement",
+        "Sales & Return 360°",
+        "Customer SKU & Price Master",
+        "User Working Summary",
+        "Upload Centre",
+        "Audit / Exceptions",
+    ]
+    if role == "Admin":
+        nav_pages.append("User Management")
+
+    page = st.radio("Navigation", nav_pages, label_visibility="collapsed")
+
     st.divider()
-    user = st.text_input("User / Team Member", "Team User")
-    role = st.selectbox(
-        "Role",
-        ["Viewer","Billing","Logistics","GRN / Returns","Admin"]
-    )
+    st.caption("Signed in as")
+    st.write(f"**{full_name or user}**")
+    st.caption(f"User ID: {user}")
+    st.caption(f"Role: {role}")
+
+    if st.button("Sign out", width="stretch"):
+        try:
+            audit_event("LOGOUT", "Authentication", user, details="User signed out")
+        except Exception:
+            pass
+        for k in ["authenticated","auth_user_id","auth_full_name","auth_role"]:
+            st.session_state.pop(k, None)
+        st.rerun()
 
 st.title("PO Fulfilment Control Tower")
 st.caption("PO → Stock → Billing → Dispatch → GRN → CN / Return")
@@ -9834,6 +10093,9 @@ elif page == "Sales & Return 360°":
 # MASTER
 # ---------------------------------------------------------
 elif page == "Customer SKU & Price Master":
+    if role != "Admin":
+        st.error("Admin access is required to edit the Customer SKU & Price Master.")
+        st.stop()
     st.subheader("Customer Item Code + ERP Item Code & Price Master")
     st.caption(
         "Search, filter, edit any master detail at row level, and download only the "
@@ -10106,6 +10368,30 @@ elif page == "Customer SKU & Price Master":
                             old_customer_item,
                         )
                     )
+                    audit_event_conn(
+                        con, user, role,
+                        "UPDATE", "Customer SKU & Price Master",
+                        f"{old_ledger}|{old_customer_item}",
+                        json.dumps({
+                            "customer_no": text_value(old_row.get("customer_no")),
+                            "ledger_name": old_ledger,
+                            "customer_item_code": old_customer_item,
+                            "erp_item_code": text_value(old_row.get("erp_item_code")),
+                            "item_description": text_value(old_row.get("item_description")),
+                            "price": round(number_value(old_row.get("price")), 2),
+                            "ean": text_value(old_row.get("ean")),
+                        }, default=str),
+                        json.dumps({
+                            "customer_no": new_customer_no,
+                            "ledger_name": new_ledger,
+                            "customer_item_code": new_customer_item,
+                            "erp_item_code": new_erp,
+                            "item_description": new_desc,
+                            "price": new_price,
+                            "ean": new_ean,
+                        }, default=str),
+                        "Row-level master edit"
+                    )
                     changed += 1
 
                 con.commit()
@@ -10271,6 +10557,9 @@ elif page == "User Working Summary":
 # UPLOAD CENTRE
 # ---------------------------------------------------------
 elif page == "Upload Centre":
+    if role == "Viewer":
+        st.error("Viewer accounts cannot upload or process source files.")
+        st.stop()
     st.subheader("Data Upload Centre")
     st.info(
         "Duplicate Protection ACTIVE: the same file/details will not be uploaded twice. "
@@ -11035,6 +11324,143 @@ elif page == "Upload Centre":
     st.dataframe(history, width="stretch", hide_index=True, height=360)
 
 # ---------------------------------------------------------
+# USER MANAGEMENT
+# ---------------------------------------------------------
+elif page == "User Management":
+    if role != "Admin":
+        st.error("Admin access required.")
+        st.stop()
+
+    st.subheader("User Management")
+    st.caption(
+        "Create individual login IDs, assign roles, activate/deactivate accounts "
+        "and reset passwords."
+    )
+
+    tab_create, tab_manage = st.tabs(["Create User", "Manage Users"])
+
+    with tab_create:
+        with st.form("create_user_form"):
+            c1, c2 = st.columns(2)
+            with c1:
+                new_uid = st.text_input("User ID")
+                new_name = st.text_input("Full Name")
+            with c2:
+                new_role = st.selectbox("Role", APP_ROLES)
+                new_pw = st.text_input("Temporary Password", type="password")
+            create_ok = st.form_submit_button("Create User", type="primary")
+
+        if create_ok:
+            try:
+                create_app_user(new_uid, new_name, new_pw, new_role, user)
+                st.success(f"User '{new_uid}' created.")
+                st.rerun()
+            except Exception as e:
+                st.error(str(e))
+
+    with tab_manage:
+        users_df = read_sql(
+            """SELECT user_id,full_name,role,active,created_at,created_by,
+                      last_login,updated_at
+               FROM app_users ORDER BY user_id"""
+        )
+        if not users_df.empty:
+            selected_uid = st.selectbox(
+                "Select User",
+                users_df["user_id"].astype(str).tolist()
+            )
+            selected = users_df[
+                users_df["user_id"].astype(str) == str(selected_uid)
+            ].iloc[0]
+
+            c1, c2 = st.columns(2)
+            with c1:
+                edit_name = st.text_input(
+                    "Full Name",
+                    value=text_value(selected.get("full_name")),
+                    key="edit_user_name"
+                )
+                current_role = text_value(selected.get("role"))
+                edit_role = st.selectbox(
+                    "Role",
+                    APP_ROLES,
+                    index=APP_ROLES.index(current_role) if current_role in APP_ROLES else 0,
+                    key="edit_user_role"
+                )
+            with c2:
+                edit_active = st.checkbox(
+                    "Active",
+                    value=int(number_value(selected.get("active"))) == 1
+                )
+                reset_pw = st.text_input(
+                    "Reset Password (leave blank to keep existing)",
+                    type="password"
+                )
+
+            if st.button("Save User Changes", type="primary"):
+                if selected_uid == user and not edit_active:
+                    st.error("You cannot deactivate your own logged-in account.")
+                elif reset_pw and len(reset_pw) < 8:
+                    st.error("Password must contain at least 8 characters.")
+                else:
+                    con = open_db()
+                    try:
+                        before = json.dumps({
+                            "full_name": text_value(selected.get("full_name")),
+                            "role": text_value(selected.get("role")),
+                            "active": int(number_value(selected.get("active"))),
+                        })
+
+                        if reset_pw:
+                            ph, salt = _password_hash(reset_pw)
+                            con.execute(
+                                """UPDATE app_users
+                                   SET full_name=?,role=?,active=?,
+                                       password_hash=?,password_salt=?,updated_at=?
+                                   WHERE user_id=?""",
+                                (
+                                    edit_name, edit_role, 1 if edit_active else 0,
+                                    ph, salt,
+                                    datetime.now().isoformat(timespec="seconds"),
+                                    selected_uid
+                                )
+                            )
+                            note = "Password reset"
+                        else:
+                            con.execute(
+                                """UPDATE app_users
+                                   SET full_name=?,role=?,active=?,updated_at=?
+                                   WHERE user_id=?""",
+                                (
+                                    edit_name, edit_role, 1 if edit_active else 0,
+                                    datetime.now().isoformat(timespec="seconds"),
+                                    selected_uid
+                                )
+                            )
+                            note = ""
+
+                        after = json.dumps({
+                            "full_name": edit_name,
+                            "role": edit_role,
+                            "active": 1 if edit_active else 0,
+                        })
+                        audit_event_conn(
+                            con, user, role,
+                            "UPDATE_USER", "User Management",
+                            selected_uid, before, after, note
+                        )
+                        con.commit()
+                    finally:
+                        con.close()
+
+                    st.success(f"User '{selected_uid}' updated.")
+                    st.rerun()
+
+            st.dataframe(users_df, width="stretch", hide_index=True, height=360)
+        else:
+            st.info("No users found.")
+
+# ---------------------------------------------------------
 # AUDIT / EXCEPTIONS
 # ---------------------------------------------------------
 elif page == "Audit / Exceptions":
@@ -11051,8 +11477,9 @@ elif page == "Audit / Exceptions":
     ], columns=["Source","Database Rows"])
     st.dataframe(health, width="stretch", hide_index=True)
 
-    tab1,tab2,tab3 = st.tabs([
+    tab1,tab2,tab3,tab4 = st.tabs([
         "Upload History",
+        "User / Change Audit",
         "GRN Working Audit",
         "Reconciliation Exceptions"
     ])
@@ -11062,10 +11489,31 @@ elif page == "Audit / Exceptions":
         st.dataframe(history,width="stretch",hide_index=True,height=500)
 
     with tab2:
+        change_audit = read_sql(
+            """SELECT id,event_time,user_id,role,action,module,record_key,
+                      before_value,after_value,details
+               FROM app_audit_log ORDER BY id DESC"""
+        )
+        audit_search = st.text_input(
+            "Search User / Change Audit",
+            placeholder="Search user, action, module, record key...",
+            key="audit_change_search"
+        ).strip()
+        if audit_search and not change_audit.empty:
+            searchable = change_audit.fillna("").astype(str).apply(
+                lambda c: c.str.lower()
+            )
+            mask = searchable.apply(
+                lambda c: c.str.contains(audit_search.lower(), regex=False)
+            ).any(axis=1)
+            change_audit = change_audit.loc[mask].copy()
+        st.dataframe(change_audit,width="stretch",hide_index=True,height=500)
+
+    with tab3:
         audit = read_sql("SELECT * FROM grn_manual_audit ORDER BY id DESC")
         st.dataframe(audit,width="stretch",hide_index=True,height=500)
 
-    with tab3:
+    with tab4:
         main = full_main_dashboard()
         if main.empty:
             st.info("No reconciliation rows yet.")
