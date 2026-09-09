@@ -7182,6 +7182,159 @@ def normalize_uploaded_grn_working(df):
     return df[recognized].copy()
 
 
+def prepare_mor_master_grn_working(df):
+    """
+    Convert the reviewed MOR Master File format into the Main Reconciliation
+    GRN working format.
+
+    Reviewed source columns include:
+      Invoice No.
+      Po Number
+      Ledger Name
+      Product/Item No
+      Item Description
+      Bill Quantity
+      GRN Quantity
+      Delivery / Invoice cancel date
+      Delivery Remarks
+      MIR No.
+      Sumit Invoice upload
+
+    Matching key:
+      PO + Invoice + ERP Item
+
+    GRN No., GRN Date and POD Remarks are preserved from the existing
+    reconciliation/GRN record because the MOR file does not contain them.
+    """
+    if df is None or df.empty:
+        raise ValueError("MOR Master File is empty.")
+
+    c_po = find_col(df, ["Po Number","PO Number","PO No.","PO No","Customer PO Number"])
+    c_inv = find_col(df, ["Invoice No.","Invoice No","Invoice Number"])
+    c_sku = find_col(df, ["Product/Item No","Product/Item No.","ERP Item","ERP Item Code","Item No"])
+    c_ledger = find_col(df, ["Ledger Name","Customer Name"])
+    c_desc = find_col(df, ["Item Description","Product Description"])
+    c_bill_qty = find_col(df, ["Bill Quantity","Billed Qty","Invoice Qty","Invoice Quantity"])
+    c_grn_qty = find_col(df, ["GRN Quantity","GRN Qty","Received Qty","Accepted Qty","Qty Recd"])
+    c_delivery_date = find_col(
+        df,
+        ["Delivery / Invoice cancel date","Delivery/Invoice cancel date",
+         "Delivery/Cancel Date","Delivery Date","Invoice cancel date"]
+    )
+    c_delivery_remarks = find_col(df, ["Delivery Remarks","Remarks"])
+    c_mir = find_col(df, ["MIR No.","MIR No","MIR Number"])
+    c_sumit = find_col(df, ["Sumit Invoice upload","Sumit Invoice Upload"])
+    c_short = find_col(df, ["Short Delivered","Short Delivery Qty"])
+
+    missing = []
+    if c_po is None: missing.append("Po Number")
+    if c_inv is None: missing.append("Invoice No.")
+    if c_sku is None: missing.append("Product/Item No")
+    if c_grn_qty is None: missing.append("GRN Quantity")
+    if missing:
+        raise ValueError(
+            "MOR Master File is missing required column(s): " + ", ".join(missing)
+        )
+
+    def _mor_text(v):
+        s = _clean_excel_value(v)
+        if s.strip().upper() in ("-", "N/A", "NA", "NONE", "NAN"):
+            return ""
+        return s
+
+    con = open_db()
+    rows = []
+    try:
+        for _, r in df.iterrows():
+            po_no = _mor_text(r.get(c_po))
+            invoice_no = _mor_text(r.get(c_inv))
+            sku = _mor_text(r.get(c_sku))
+
+            if not po_no or not invoice_no or not sku:
+                continue
+
+            existing = _grn_existing_row(con, po_no, invoice_no, sku)
+            existing_map = {}
+            if existing:
+                if USE_POSTGRES:
+                    cols = [d[0] for d in con.execute(
+                        """SELECT column_name
+                           FROM information_schema.columns
+                           WHERE table_schema='public' AND table_name='grn_lines'
+                           ORDER BY ordinal_position"""
+                    ).fetchall()]
+                else:
+                    cols = [d[1] for d in con.execute("PRAGMA table_info(grn_lines)").fetchall()]
+                existing_map = dict(zip(cols, existing))
+
+            # Prefer authoritative override values when already present.
+            override = con.execute(
+                """SELECT grn_no,grn_date,grn_qty,delivery_cancel_date,
+                          delivery_remarks,short_delivered,mir_no,
+                          sumit_invoice_upload,pod_remarks
+                   FROM grn_reconciliation_override
+                   WHERE UPPER(TRIM(COALESCE(po_no,'')))=UPPER(TRIM(?))
+                     AND UPPER(TRIM(COALESCE(invoice_no,'')))=UPPER(TRIM(?))
+                     AND UPPER(TRIM(COALESCE(erp_item_code,'')))=UPPER(TRIM(?))
+                   ORDER BY id DESC LIMIT 1""",
+                (po_no, invoice_no, sku)
+            ).fetchone()
+
+            if override:
+                current = {
+                    "GRN No.": _clean_excel_value(override[0]),
+                    "GRN Date": _clean_excel_value(override[1]),
+                    "POD Remarks": _clean_excel_value(override[8]),
+                }
+            else:
+                current = {
+                    "GRN No.": _clean_excel_value(existing_map.get("grn_no","")),
+                    "GRN Date": _clean_excel_value(existing_map.get("grn_date","")),
+                    "POD Remarks": _clean_excel_value(existing_map.get("pod_remarks","")),
+                }
+
+            bill_qty = number_value(r.get(c_bill_qty)) if c_bill_qty else 0
+            grn_qty = number_value(r.get(c_grn_qty))
+
+            if c_short is not None:
+                short_qty = number_value(r.get(c_short))
+            elif bill_qty > 0:
+                short_qty = max(bill_qty - grn_qty, 0)
+            else:
+                short_qty = 0
+
+            rows.append({
+                "Po Number": po_no,
+                "Invoice No": invoice_no,
+                "Product/Item No": sku,
+                "Ledger Name": _mor_text(r.get(c_ledger)) if c_ledger else "",
+                "Item Description": _mor_text(r.get(c_desc)) if c_desc else "",
+                "Billed Qty": bill_qty,
+                "GRN No.": current["GRN No."],
+                "GRN Date": current["GRN Date"],
+                "GRN Qty": grn_qty,
+                "Delivery/Cancel Date": (
+                    _mor_text(r.get(c_delivery_date)) if c_delivery_date else ""
+                ),
+                "Delivery Remarks": (
+                    _mor_text(r.get(c_delivery_remarks)) if c_delivery_remarks else ""
+                ),
+                "Short Delivered": short_qty,
+                "MIR No.": _mor_text(r.get(c_mir)) if c_mir else "",
+                "Sumit Invoice upload": _mor_text(r.get(c_sumit)) if c_sumit else "",
+                "POD Remarks": current["POD Remarks"],
+            })
+    finally:
+        con.close()
+
+    if not rows:
+        raise ValueError(
+            "No valid MOR rows found. PO, Invoice and Product/Item No must be populated."
+        )
+
+    return pd.DataFrame(rows)
+
+
 # =========================================================
 # ROBUST DASHBOARD FALLBACKS
 # =========================================================
@@ -9515,9 +9668,9 @@ full_name = text_value(st.session_state.get("auth_full_name"))
 
 with st.sidebar:
     st.caption(
-        "Database: Supabase PostgreSQL • V63.49 CP WHOLESALE SHIP CODE FIX"
+        "Database: Supabase PostgreSQL • V63.50 MOR GRN EXCEL UPLOAD"
         if USE_POSTGRES else
-        "Database: Local SQLite • V63.49 CP WHOLESALE SHIP CODE FIX"
+        "Database: Local SQLite • V63.50 MOR GRN EXCEL UPLOAD"
     )
     st.markdown("## Control Tower")
 
@@ -10056,6 +10209,57 @@ if page == "Main Reconciliation Dashboard":
                 "text/csv",
                 width="stretch"
             )
+
+        st.markdown("#### Upload MOR Master File — Bulk GRN Update")
+        st.caption(
+            "Upload the MOR Master Excel in the same format shared with the team. "
+            "The app matches PO + Invoice + Product/Item No and updates GRN Quantity, "
+            "Delivery/Cancel Date, Delivery Remarks, Short Delivered, MIR No. and "
+            "Sumit Invoice upload in Main Reconciliation. Existing GRN No./Date are preserved."
+        )
+
+        uploaded_mor_grn = st.file_uploader(
+            "Upload MOR Master File",
+            type=["xlsx","xls"],
+            key=f"mor_grn_upload_{('_'.join(selected_pos) if selected_pos else 'ALL')}"
+        )
+
+        if uploaded_mor_grn is not None:
+            if st.button(
+                "Apply MOR GRN Updates",
+                type="primary",
+                key=f"apply_mor_grn_{('_'.join(selected_pos) if selected_pos else 'ALL')}"
+            ):
+                try:
+                    mor_source_df = read_excel(uploaded_mor_grn.getvalue())
+                    mor_working_df = prepare_mor_master_grn_working(mor_source_df)
+
+                    saved, audited = save_grn_working_changes(
+                        mor_working_df,
+                        user,
+                        f"MOR Master File upload: {uploaded_mor_grn.name}"
+                    )
+
+                    try:
+                        audit_event(
+                            "BULK_GRN_UPDATE",
+                            "MOR Master File",
+                            record_key=uploaded_mor_grn.name,
+                            after_value=f"rows_prepared={len(mor_working_df)}; rows_saved={saved}",
+                            details=f"{audited} GRN audit change(s) logged."
+                        )
+                    except Exception:
+                        pass
+
+                    st.success(
+                        f"MOR Master File applied successfully: "
+                        f"{len(mor_working_df):,} row(s) matched/prepared, "
+                        f"{saved:,} reconciliation row(s) updated, "
+                        f"{audited:,} audit change(s) logged."
+                    )
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Could not apply MOR Master File: {e}")
 
         st.markdown("#### Upload Completed GRN Working Sheet — Final Override")
         uploaded_grn_work = st.file_uploader(
