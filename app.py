@@ -2148,6 +2148,12 @@ def parse_customer_po_excel_by_mapping(raw, source_file, upload_id):
             else:
                 updated += 1
 
+            resolved_ship_code = resolve_ship_to_code_priority(
+                po_no,
+                ledger,
+                header.get("Ship to Location","")
+            )
+
             parsed.append({
                 "Profile": profile,
                 "PO No": po_no,
@@ -2160,6 +2166,7 @@ def parse_customer_po_excel_by_mapping(raw, source_file, upload_id):
                 "PO Qty": qty,
                 "PO Value": po_value,
                 "Ship to Location": header.get("Ship to Location",""),
+                "Ship to Location Code": resolved_ship_code,
                 "Ship to GST no as per PO": header.get("Ship to GST no as per PO",""),
                 "Excel Row": row_no,
             })
@@ -2570,45 +2577,66 @@ def repair_pdf_po_header(profile, full_text, header):
         if m:
             h["PO Expiry/DELIVERY DATE"] = _header_date(m.group(1))
 
-        # LOTS/CP Wholesale places the complete destination in the first
-        # Bill-To/Ship-to block. Capture ONLY that block so vendor / registered
-        # office PINs cannot be mistaken for the destination PIN.
-        bill = re.search(
-            r"Bill[−–-]To\s+Address/Ship\s+to\s+Address"
-            r"(.*?)(?=Bill[−–-]from\s+Address)",
-            full_text,
-            re.I | re.S
+        # CP Wholesale/LOTS PDF text is extracted horizontally across
+        # Bill-To, Bill-from and Ship-from columns. Therefore the text between
+        # "Bill-To Address/Ship to Address" and "Bill-from Address" is empty.
+        # Build the destination from stable Bill-To-specific tokens instead.
+        flat = re.sub(r"\s+", " ", full_text)
+
+        # Warehouse/store name, e.g. CPWI Pvt.Ltd.-ITH 102 / CPWI Pvt Ltd.-GNI 106
+        wh = re.search(
+            r"Name:\s*(CPWI\s+Pvt\.?\s*Ltd\.?\s*[−–-]\s*[A-Z]+)\s+(\d{2,4})",
+            flat,
+            re.I
         )
-        if bill:
-            bill_text = bill.group(1)
+        warehouse = ""
+        if wh:
+            warehouse = f"{_clean_po_address(wh.group(1))} {wh.group(2)}"
 
-            # Keep warehouse name + address + PIN together for Ship-to Master.
-            h["Ship to Location"] = _clean_po_address(bill_text)
+        # Destination PIN: prefer a 201xxx PIN in the first Bill-To area.
+        # Stop before the first supplier GSTIN so registered-office/vendor PIN
+        # can never become the Ship-to PIN.
+        bill_prefix = flat
+        supplier_gstin_pos = re.search(r"06AACCA4437G1ZZ", flat, re.I)
+        if supplier_gstin_pos:
+            bill_prefix = flat[:supplier_gstin_pos.start()]
 
-            g = re.search(
-                r"GSTIN\s+No\s*:\s*([0-9A-Z]{15})",
-                bill_text,
+        pin_candidates = re.findall(
+            r"(?<!\d)(20\d{4})(?!\d)",
+            bill_prefix
+        )
+        dest_pin = pin_candidates[-1] if pin_candidates else ""
+
+        # Destination GSTIN belongs to CP Wholesale and starts with the
+        # destination state code, not Glen's 06AAC... supplier GSTIN.
+        dest_gst = ""
+        gst_matches = re.findall(
+            r"GSTIN\s+No\s*:\s*([0-9A-Z]{15})",
+            flat,
+            re.I
+        )
+        for gst in gst_matches:
+            if "AAGCC7979R" in gst.upper():
+                dest_gst = gst.upper()
+                break
+
+        # Preserve enough address text for diagnostics while guaranteeing PIN.
+        city = ""
+        if dest_pin:
+            city_mt = re.search(
+                rf"([A-Za-z ]{{2,30}})[−–-]\s*{re.escape(dest_pin)}",
+                flat,
                 re.I
             )
-            if g:
-                h["Ship to GST no as per PO"] = g.group(1).upper()
+            if city_mt:
+                city = _clean_po_address(city_mt.group(1))
 
-            # Explicit destination PIN safeguard.
-            pin = extract_pin_from_text(bill_text)
-            if pin and pin not in h["Ship to Location"]:
-                h["Ship to Location"] = _clean_po_address(
-                    f"{h['Ship to Location']} PIN {pin}"
-                )
+        ship_parts = [x for x in [warehouse, city, f"PIN {dest_pin}" if dest_pin else ""] if x]
+        if ship_parts:
+            h["Ship to Location"] = " | ".join(ship_parts)
 
-        # Alternate compact extraction where Bill-from marker is missing.
-        if not extract_pin_from_text(h.get("Ship to Location","")):
-            m = re.search(
-                r"Store/Warehouse\s+Name:\s*(.+?)(?=\s+Bill[−–-]from|\s+Vendor\s+Name:)",
-                full_text,
-                re.I | re.S
-            )
-            if m:
-                h["Ship to Location"] = _clean_po_address(m.group(1))
+        if dest_gst:
+            h["Ship to GST no as per PO"] = dest_gst
 
     elif "METRO" in p:
         m = re.search(r"PO\s+NO\.\s*:\s*([0-9]+)", full_text, re.I)
@@ -2801,10 +2829,20 @@ def parse_customer_po_pdf_by_mapping(raw, source_file, upload_id):
             po_value = number_value(values.get("PO Value"))
             unit_price = number_value(values.get("PO Unit Price"))
             description_po = text_value(values.get("Item Description"))
-
-            erp, master_desc, master_price = resolve_po_erp_item(
-                con, ledger, customer_item
+            ean_po = text_value(
+                values.get("EAN")
+                or values.get("EAN/BarCode")
+                or values.get("Barcode")
             )
+
+            if "resolve_po_erp_item_with_ean" in globals():
+                erp, master_desc, master_price = resolve_po_erp_item_with_ean(
+                    con, ledger, customer_item, ean_po
+                )
+            else:
+                erp, master_desc, master_price = resolve_po_erp_item(
+                    con, ledger, customer_item
+                )
             if not erp:
                 unmapped += 1
 
@@ -9477,9 +9515,9 @@ full_name = text_value(st.session_state.get("auth_full_name"))
 
 with st.sidebar:
     st.caption(
-        "Database: Supabase PostgreSQL • V63.48 CP WHOLESALE SHIP-TO + SKU FIX"
+        "Database: Supabase PostgreSQL • V63.49 CP WHOLESALE SHIP CODE FIX"
         if USE_POSTGRES else
-        "Database: Local SQLite • V63.48 CP WHOLESALE SHIP-TO + SKU FIX"
+        "Database: Local SQLite • V63.49 CP WHOLESALE SHIP CODE FIX"
     )
     st.markdown("## Control Tower")
 
