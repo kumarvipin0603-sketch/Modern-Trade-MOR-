@@ -2165,6 +2165,10 @@ def parse_customer_po_excel_by_mapping(raw, source_file, upload_id):
                 "ERP Item": erp,
                 "PO Qty": qty,
                 "PO Value": po_value,
+                "Ordered Qty (PO UOM)": values.get("Walmart Ordered Qty",""),
+                "UOM": values.get("Walmart UOM",""),
+                "Pack": values.get("Walmart Pack",""),
+                "EA per CS": values.get("Walmart EA/CS",""),
                 "Ship to Location": header.get("Ship to Location",""),
                 "Ship to Location Code": resolved_ship_code,
                 "Ship to GST no as per PO": header.get("Ship to GST no as per PO",""),
@@ -2789,6 +2793,60 @@ def parse_customer_po_pdf_by_mapping(raw, source_file, upload_id):
                             values["PO Value"] = blink_total
                         else:
                             continue
+
+
+                # Walmart quantity can be ordered in CS (cartons), while Pack
+                # defines the number of EA in each carton, e.g. 4EA/1CS.
+                #
+                # Reviewed Walmart table columns:
+                #   [2] Quantity Ordered
+                #   [3] UOM
+                #   [4] Pack
+                #   [10] Total Amount (Incl. Taxes)
+                #
+                # B2B must use EACH quantity and basic EACH price:
+                #   Total EA Qty = Ordered CS Qty × (EA per CS)
+                #   Basic EA Price = Total Incl. Tax / Total EA Qty / 1.18
+                if (
+                    ("WALMART" in profile.upper() or "WAL-MART" in profile.upper())
+                    and len(row) >= 11
+                ):
+                    ordered_qty = number_value(row[2])
+                    uom = text_value(row[3]).strip().upper()
+                    pack_text = text_value(row[4]).strip().upper()
+                    total_incl_tax = number_value(row[10])
+
+                    total_ea_qty = ordered_qty
+                    ea_per_cs = 1.0
+
+                    if uom in ("CS", "CASE", "CASES", "CTN", "CARTON", "CARTONS"):
+                        mt_pack = re.search(
+                            r"([0-9]+(?:\.[0-9]+)?)\s*EA\s*/\s*"
+                            r"([0-9]+(?:\.[0-9]+)?)\s*CS",
+                            pack_text,
+                            re.I
+                        )
+                        if mt_pack:
+                            ea_qty_pack = number_value(mt_pack.group(1))
+                            cs_qty_pack = number_value(mt_pack.group(2))
+                            if ea_qty_pack > 0 and cs_qty_pack > 0:
+                                ea_per_cs = ea_qty_pack / cs_qty_pack
+                                total_ea_qty = ordered_qty * ea_per_cs
+
+                    if total_ea_qty > 0:
+                        values["PO Qty"] = total_ea_qty
+                        if total_incl_tax > 0:
+                            values["PO Unit Price"] = round(
+                                (total_incl_tax / total_ea_qty) / 1.18,
+                                2
+                            )
+                            values["PO Value"] = total_incl_tax
+
+                    # Diagnostic fields shown in upload preview when available.
+                    values["Walmart Ordered Qty"] = ordered_qty
+                    values["Walmart UOM"] = uom
+                    values["Walmart Pack"] = pack_text
+                    values["Walmart EA/CS"] = ea_per_cs
 
                 if "METRO" in profile.upper() and len(row) >= 11:
                     ea_qty, ea_unit_price, total_base_value = _metro_ea_qty_and_unit_price(row)
@@ -3428,9 +3486,38 @@ def parse_walmart_customer_po_pdf(raw, source_file, upload_id):
                 continue
 
             customer_item = article_match.group(1).strip()
-            qty = number_value(row[2])
-            unit_cost = number_value(row[6])
+
+            ordered_qty = number_value(row[2])
+            uom = text_value(row[3]).strip().upper()
+            pack_text = text_value(row[4]).strip().upper()
             total_incl_tax = number_value(row[10])
+
+            # Convert Walmart CS/carton quantity to EA quantity.
+            ea_per_cs = 1.0
+            qty = ordered_qty
+
+            if uom in ("CS", "CASE", "CASES", "CTN", "CARTON", "CARTONS"):
+                mt_pack = re.search(
+                    r"([0-9]+(?:\.[0-9]+)?)\s*EA\s*/\s*"
+                    r"([0-9]+(?:\.[0-9]+)?)\s*CS",
+                    pack_text,
+                    re.I
+                )
+                if mt_pack:
+                    ea_qty_pack = number_value(mt_pack.group(1))
+                    cs_qty_pack = number_value(mt_pack.group(2))
+                    if ea_qty_pack > 0 and cs_qty_pack > 0:
+                        ea_per_cs = ea_qty_pack / cs_qty_pack
+                        qty = ordered_qty * ea_per_cs
+
+            # B2B basic EACH price:
+            # Total Amount (Incl. Taxes) / Total EA Qty / 1.18
+            unit_cost = (
+                round((total_incl_tax / qty) / 1.18, 2)
+                if qty > 0 and total_incl_tax > 0
+                else 0
+            )
+
             pdf_desc = _clean_walmart_description(article_cell)
 
             erp, master_desc, master_price = resolve_po_erp_item(
@@ -3455,7 +3542,7 @@ def parse_walmart_customer_po_pdf(raw, source_file, upload_id):
 
             description = master_desc or pdf_desc
             price = unit_cost if unit_cost else number_value(master_price)
-            po_value = total_incl_tax if total_incl_tax else (qty * price)
+            po_value = total_incl_tax if total_incl_tax else (qty * price * 1.18)
 
             action = upsert_po_line(
                 con,
@@ -3487,6 +3574,10 @@ def parse_walmart_customer_po_pdf(raw, source_file, upload_id):
                 "Customer Item": customer_item,
                 "ERP Item": text_value(erp),
                 "Description": description,
+                "Ordered Qty (PO UOM)": ordered_qty,
+                "UOM": uom,
+                "Pack": pack_text,
+                "EA per CS": ea_per_cs,
                 "PO Qty": qty,
                 "PO Unit Price": price,
                 "PO Value": po_value,
@@ -9694,10 +9785,19 @@ def build_b2b_order_staging():
 
         qty_b2b = number_value(r.get("po_qty"))
 
-        # B2B commercial prices must remain at 2-decimal precision.
-        # Do NOT convert/round them to a whole rupee because even ₹0.01/₹0.02
-        # per unit changes the extended value when quantity is multiplied.
-        price_b2b = round(number_value(r.get("po_unit_price")), 2)
+        # V63.52 B2B PRICE RULE
+        # Basic Unit Price = Total Amount (Incl. Taxes) / Qty / 1.18
+        # Round only the FINAL unit price to 2 decimals.
+        po_total_incl_tax_b2b = number_value(r.get("po_value"))
+        if qty_b2b > 0 and po_total_incl_tax_b2b > 0:
+            price_b2b = round(
+                (po_total_incl_tax_b2b / qty_b2b) / 1.18,
+                2
+            )
+        else:
+            # Fallback only when the PO total is unavailable.
+            price_b2b = round(number_value(r.get("po_unit_price")), 2)
+
         master_price_b2b = round(number_value(r.get("_master_price")), 2)
 
         if "BLINK" in ledger.upper():
@@ -9733,7 +9833,8 @@ def build_b2b_order_staging():
             )
 
             if price_is_corrupt:
-                price_b2b = round(master_price_b2b, 2)
+                # Retain formula-based B2B price from Total Incl. Tax / Qty / 1.18.
+                pass
             if qty_is_corrupt and derived_qty > 0:
                 qty_b2b = derived_qty
 
@@ -9960,9 +10061,9 @@ full_name = text_value(st.session_state.get("auth_full_name"))
 
 with st.sidebar:
     st.caption(
-        "Database: Supabase PostgreSQL • V63.51 MOR VALIDATION ONLY"
+        "Database: Supabase PostgreSQL • V63.53 WALMART CASE QTY + PRICE FIX"
         if USE_POSTGRES else
-        "Database: Local SQLite • V63.51 MOR VALIDATION ONLY"
+        "Database: Local SQLite • V63.53 WALMART CASE QTY + PRICE FIX"
     )
     st.markdown("## Control Tower")
 
