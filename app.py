@@ -9800,6 +9800,40 @@ def build_b2b_order_staging():
 
         master_price_b2b = round(number_value(r.get("_master_price")), 2)
 
+        # V63.54 WALMART LIVE REPAIR
+        # Older Walmart PO rows may already be stored with carton quantity (CS)
+        # instead of total each quantity (EA). We can safely repair mapped rows
+        # at B2B staging time using the tax-inclusive line total and the
+        # Customer SKU & Price Master basic EA price:
+        #
+        #   Derived EA Qty = Total Incl. Tax / Master EA Price / 1.18
+        #
+        # Example:
+        #   46756.32 / 1651 / 1.18 = 24 EA
+        #
+        # Apply only when the result is effectively a whole quantity. This
+        # avoids changing rows where the master price or PO amount is not
+        # commercially consistent.
+        if (
+            ("WALMART" in ledger.upper() or "WAL-MART" in ledger.upper())
+            and master_price_b2b > 0
+            and po_total_incl_tax_b2b > 0
+        ):
+            derived_ea_qty = (
+                po_total_incl_tax_b2b / master_price_b2b / 1.18
+            )
+            rounded_ea_qty = round(derived_ea_qty)
+
+            if (
+                rounded_ea_qty > 0
+                and abs(derived_ea_qty - rounded_ea_qty) <= 0.02
+            ):
+                qty_b2b = float(rounded_ea_qty)
+                price_b2b = round(
+                    (po_total_incl_tax_b2b / qty_b2b) / 1.18,
+                    2
+                )
+
         if "BLINK" in ledger.upper():
             # Repair legacy/corrupted Blinkit rows already stored in po_lines.
             # Blinkit B2B Unit Price must equal the PO Landing Rate / master price.
@@ -10061,9 +10095,9 @@ full_name = text_value(st.session_state.get("auth_full_name"))
 
 with st.sidebar:
     st.caption(
-        "Database: Supabase PostgreSQL • V63.53 WALMART CASE QTY + PRICE FIX"
+        "Database: Supabase PostgreSQL • V63.54 WALMART B2B LIVE REPAIR"
         if USE_POSTGRES else
-        "Database: Local SQLite • V63.53 WALMART CASE QTY + PRICE FIX"
+        "Database: Local SQLite • V63.54 WALMART B2B LIVE REPAIR"
     )
     st.markdown("## Control Tower")
 
