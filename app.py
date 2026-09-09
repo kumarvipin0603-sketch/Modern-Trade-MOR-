@@ -5363,6 +5363,144 @@ def _parse_known_grn_pdf(raw):
     upper_text = full_text.upper()
 
     # -----------------------------
+    # ZEPTO / KIRANAKART GRN
+    # -----------------------------
+    # Reviewed layouts:
+    #   BLR-SS-MH-SUMADHURA
+    #   CHN-SS-MH-THIRUVALLUR
+    #   MUM-SS-MH-SHAKTI
+    #
+    # The PDF extractor can split GRN No. and Invoice No. across lines:
+    #   GrnCode582284 + 68   => GrnCode58228468
+    #   SI262751- + 010233   => SI262751-010233
+    #
+    # Use a built-in parser so these layouts do not depend on fragile
+    # header/table mappings.
+    if (
+        "AAICK4821A1Z" in upper_text
+        and "GLEN APPLIANCES PRIVATE LIMITED" in upper_text
+        and "GRN NO:" in upper_text
+        and "RECV" in upper_text
+        and "UNIT" in upper_text
+        and "PRICE" in upper_text
+    ):
+        flat_text = re.sub(r"\s+", " ", full_text)
+
+        def _zrx(pattern):
+            m = re.search(pattern, flat_text, re.I | re.S)
+            return text_value(m.group(1)).strip() if m else ""
+
+        po_no = _zrx(r"PO\s*No\s*:\s*([A-Z0-9\-]+)")
+
+        # Capture all digits between GrnCode and GRN Date, then remove spaces.
+        grn_digits = _zrx(
+            r"GRN\s*No\s*:\s*GrnCode\s*([0-9 ]+?)\s+GRN\s*Date\s*:"
+        )
+        grn_no = "GrnCode" + re.sub(r"\s+", "", grn_digits) if grn_digits else ""
+
+        # Capture invoice token, tolerating a line break after the hyphen.
+        invoice_raw = _zrx(
+            r"Invoice(?:\s+No)?\s*:\s*(SI[0-9]+\s*-\s*[0-9]+)"
+        )
+        if not invoice_raw:
+            invoice_raw = _zrx(
+                r"Invoice\s+(SI[0-9]+\s*-\s*[0-9]+)\s+Invoice"
+            )
+        invoice_no = re.sub(r"\s+", "", invoice_raw)
+
+        grn_date = _zrx(
+            r"GRN\s*Date\s*:\s*([0-9]{1,2}\s*-\s*[0-9]{1,2}\s*-\s*[0-9]{4})"
+        )
+        invoice_date = _zrx(
+            r"Invoice(?:\s+Date)?\s*:\s*([0-9]{1,2}\s*-\s*[0-9]{1,2}\s*-\s*[0-9]{4})"
+        )
+        if not invoice_date:
+            # In this layout the right-hand Invoice Date may appear after the
+            # invoice number without the "Invoice Date:" text being contiguous.
+            m = re.search(
+                r"(?:SI[0-9]+\s*-\s*[0-9]+).*?([0-9]{1,2}\s*-\s*[0-9]{1,2}\s*-\s*[0-9]{4})",
+                flat_text,
+                re.I | re.S
+            )
+            invoice_date = text_value(m.group(1)).strip() if m else ""
+
+        header = {
+            "Ledger Name": "Zepto Limited",
+            "PO No": po_no,
+            "Invoice No": invoice_no,
+            "Invoice Date": date_value(invoice_date),
+            "GRN No": grn_no,
+            "GRN Date": date_value(grn_date),
+        }
+
+        # Find the line-item table by stable headers.
+        item_table = None
+        for table in tables:
+            if not table:
+                continue
+            header_join = " ".join(
+                text_value(c) for row in table[:3] for c in (row or [])
+            ).upper()
+            if (
+                "SKU" in header_join
+                and "RECV" in header_join
+                and "UNIT" in header_join
+                and "PRICE" in header_join
+            ):
+                item_table = table
+                break
+
+        if item_table:
+            added = duplicates = 0
+            parsed = []
+            con = open_db()
+            try:
+                for row in item_table:
+                    if not row or len(row) < 6:
+                        continue
+
+                    sr_no = text_value(row[0]).strip()
+                    if not re.fullmatch(r"\d+", sr_no):
+                        continue
+
+                    description = text_value(row[1]).strip()
+                    expected_qty = number_value(row[3])
+                    received_qty = number_value(row[4])
+
+                    if received_qty <= 0:
+                        continue
+
+                    values = dict(header)
+                    values["Item Description"] = description
+                    values["Invoice Qty"] = expected_qty
+                    values["GRN Qty"] = received_qty
+
+                    # ERP item is intentionally left blank here. The existing
+                    # _grn_insert_row() safely resolves it against Sale Register
+                    # by PO + Invoice + unique exact quantity for these invoices.
+                    if _grn_insert_row(con, values, "Built-in PDF:ZEPTO GRN"):
+                        added += 1
+                    else:
+                        duplicates += 1
+
+                    preview = dict(values)
+                    preview["Profile"] = "ZEPTO GRN BUILT-IN"
+                    parsed.append(preview)
+
+                con.commit()
+            finally:
+                con.close()
+
+            if parsed:
+                invalidate_dashboard_cache()
+                return {
+                    "profile": "ZEPTO GRN BUILT-IN",
+                    "added": added,
+                    "duplicates": duplicates,
+                    "rows": pd.DataFrame(parsed),
+                }
+
+    # -----------------------------
     # METRO CASH & CARRY
     # -----------------------------
     if "METRO CASH & CARRY INDIA LIMITED" in upper_text and "GOODS RECEIPT NOTE" in upper_text:
@@ -9246,9 +9384,9 @@ full_name = text_value(st.session_state.get("auth_full_name"))
 
 with st.sidebar:
     st.caption(
-        "Database: Supabase PostgreSQL • V63.46 SALES ORDER FAST POSTGRES FIX"
+        "Database: Supabase PostgreSQL • V63.47 ZEPTO GRN FIX"
         if USE_POSTGRES else
-        "Database: Local SQLite • V63.46 SALES ORDER FAST POSTGRES FIX"
+        "Database: Local SQLite • V63.47 ZEPTO GRN FIX"
     )
     st.markdown("## Control Tower")
 
