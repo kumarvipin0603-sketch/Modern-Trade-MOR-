@@ -7338,6 +7338,298 @@ def prepare_mor_master_grn_working(df):
 # =========================================================
 # ROBUST DASHBOARD FALLBACKS
 # =========================================================
+
+def validate_mor_master_against_reconciliation(df):
+    """
+    VALIDATION ONLY.
+
+    Compares the uploaded MOR Master File against the current Main
+    Reconciliation without writing or overwriting any reconciliation value.
+
+    Matching key:
+      PO Number + Invoice No + Product/Item No
+
+    Returns one validation row per source Excel row with:
+      - key validation
+      - duplicate source-key detection
+      - reconciliation match status
+      - quantity checks
+      - existing-vs-uploaded GRN/detail conflicts
+      - field-by-field current/uploaded values
+    """
+    if df is None or df.empty:
+        raise ValueError("MOR Master File is empty.")
+
+    c_po = find_col(df, ["Po Number","PO Number","PO No.","PO No","Customer PO Number"])
+    c_inv = find_col(df, ["Invoice No.","Invoice No","Invoice Number"])
+    c_sku = find_col(df, ["Product/Item No","Product/Item No.","ERP Item","ERP Item Code","Item No"])
+    c_ledger = find_col(df, ["Ledger Name","Customer Name"])
+    c_desc = find_col(df, ["Item Description","Product Description"])
+    c_bill_qty = find_col(df, ["Bill Quantity","Billed Qty","Invoice Qty","Invoice Quantity"])
+    c_grn_qty = find_col(df, ["GRN Quantity","GRN Qty","Received Qty","Accepted Qty","Qty Recd"])
+    c_delivery_date = find_col(
+        df,
+        ["Delivery / Invoice cancel date","Delivery/Invoice cancel date",
+         "Delivery/Cancel Date","Delivery Date","Invoice cancel date"]
+    )
+    c_delivery_remarks = find_col(df, ["Delivery Remarks","Remarks"])
+    c_mir = find_col(df, ["MIR No.","MIR No","MIR Number"])
+    c_sumit = find_col(df, ["Sumit Invoice upload","Sumit Invoice Upload"])
+    c_short = find_col(df, ["Short Delivered","Short Delivery Qty"])
+
+    missing = []
+    if c_po is None: missing.append("Po Number")
+    if c_inv is None: missing.append("Invoice No.")
+    if c_sku is None: missing.append("Product/Item No")
+    if c_grn_qty is None: missing.append("GRN Quantity")
+    if missing:
+        raise ValueError(
+            "MOR Master File is missing required column(s): " + ", ".join(missing)
+        )
+
+    def clean_text(v):
+        s = _clean_excel_value(v).strip()
+        if s.upper() in ("-", "N/A", "NA", "NONE", "NAN"):
+            return ""
+        return s
+
+    def key_text(v):
+        return clean_text(v).upper()
+
+    def norm_date(v):
+        s = clean_text(v)
+        if not s:
+            return ""
+        try:
+            dt = pd.to_datetime(v, errors="coerce", dayfirst=True)
+            if pd.notna(dt):
+                return dt.strftime("%Y-%m-%d")
+        except Exception:
+            pass
+        return s
+
+    def norm_compare_text(v):
+        return re.sub(r"\s+", " ", clean_text(v)).strip().upper()
+
+    def is_blank(v):
+        return clean_text(v) == ""
+
+    # Current reconciliation is read-only here.
+    current = full_main_dashboard()
+    if current is None:
+        current = pd.DataFrame()
+
+    required_current = [
+        "Po Number","Invoice No","Product/Item No","Billed Qty","GRN Qty",
+        "Delivery/Cancel Date","Delivery Remarks","Short Delivered",
+        "MIR No.","Sumit Invoice upload"
+    ]
+    for col in required_current:
+        if col not in current.columns:
+            current[col] = "" if col not in ("Billed Qty","GRN Qty","Short Delivered") else 0
+
+    current = current.copy()
+    current["_K"] = (
+        current["Po Number"].fillna("").astype(str).str.strip().str.upper()
+        + "||"
+        + current["Invoice No"].fillna("").astype(str).str.strip().str.upper()
+        + "||"
+        + current["Product/Item No"].fillna("").astype(str).str.strip().str.upper()
+    )
+
+    # Keep all possible matches so ambiguous reconciliation keys are visible.
+    current_groups = {
+        k: g.copy()
+        for k, g in current.groupby("_K", dropna=False)
+        if str(k).strip("|")
+    }
+
+    source = df.copy()
+    source["_Excel Row"] = range(2, len(source) + 2)
+    source["_PO"] = source[c_po].apply(key_text)
+    source["_INV"] = source[c_inv].apply(key_text)
+    source["_SKU"] = source[c_sku].apply(key_text)
+    source["_K"] = source["_PO"] + "||" + source["_INV"] + "||" + source["_SKU"]
+
+    valid_key_mask = source["_PO"].ne("") & source["_INV"].ne("") & source["_SKU"].ne("")
+    duplicate_counts = (
+        source.loc[valid_key_mask, "_K"]
+        .value_counts()
+        .to_dict()
+    )
+
+    report_rows = []
+
+    for _, r in source.iterrows():
+        po_no = clean_text(r.get(c_po))
+        invoice_no = clean_text(r.get(c_inv))
+        sku = clean_text(r.get(c_sku))
+        ledger = clean_text(r.get(c_ledger)) if c_ledger else ""
+        desc = clean_text(r.get(c_desc)) if c_desc else ""
+
+        uploaded_bill = number_value(r.get(c_bill_qty)) if c_bill_qty else 0
+        uploaded_grn = number_value(r.get(c_grn_qty))
+        uploaded_delivery_date = norm_date(r.get(c_delivery_date)) if c_delivery_date else ""
+        uploaded_delivery_remarks = clean_text(r.get(c_delivery_remarks)) if c_delivery_remarks else ""
+        uploaded_mir = clean_text(r.get(c_mir)) if c_mir else ""
+        uploaded_sumit = clean_text(r.get(c_sumit)) if c_sumit else ""
+        uploaded_short = (
+            number_value(r.get(c_short))
+            if c_short is not None
+            else max(uploaded_bill - uploaded_grn, 0) if uploaded_bill > 0 else 0
+        )
+
+        key = r["_K"]
+        issues = []
+        severity = "OK"
+
+        if not po_no:
+            issues.append("PO Number is blank")
+        if not invoice_no:
+            issues.append("Invoice No. is blank")
+        if not sku:
+            issues.append("Product/Item No is blank")
+
+        if po_no and invoice_no and sku and duplicate_counts.get(key, 0) > 1:
+            issues.append(
+                f"Duplicate key in uploaded Excel ({duplicate_counts.get(key)} rows)"
+            )
+
+        if uploaded_bill < 0:
+            issues.append("Bill Quantity is negative")
+        if uploaded_grn < 0:
+            issues.append("GRN Quantity is negative")
+        if uploaded_bill > 0 and uploaded_grn > uploaded_bill:
+            issues.append(
+                f"GRN Quantity {uploaded_grn:g} exceeds Bill Quantity {uploaded_bill:g}"
+            )
+
+        matches = current_groups.get(key)
+        match_count = 0 if matches is None else len(matches)
+
+        current_bill = 0
+        current_grn = 0
+        current_delivery_date = ""
+        current_delivery_remarks = ""
+        current_short = 0
+        current_mir = ""
+        current_sumit = ""
+
+        if not po_no or not invoice_no or not sku:
+            severity = "ERROR"
+        elif match_count == 0:
+            issues.append("No matching PO + Invoice + Product/Item row in Main Reconciliation")
+            severity = "ERROR"
+        elif match_count > 1:
+            issues.append(
+                f"Multiple matching rows in Main Reconciliation ({match_count})"
+            )
+            severity = "ERROR"
+        else:
+            cur = matches.iloc[0]
+            current_bill = number_value(cur.get("Billed Qty"))
+            current_grn = number_value(cur.get("GRN Qty"))
+            current_delivery_date = norm_date(cur.get("Delivery/Cancel Date"))
+            current_delivery_remarks = clean_text(cur.get("Delivery Remarks"))
+            current_short = number_value(cur.get("Short Delivered"))
+            current_mir = clean_text(cur.get("MIR No."))
+            current_sumit = clean_text(cur.get("Sumit Invoice upload"))
+
+            if uploaded_bill > 0 and current_bill > 0 and abs(uploaded_bill - current_bill) > 0.000001:
+                issues.append(
+                    f"Bill Quantity mismatch: Excel {uploaded_bill:g} vs Main {current_bill:g}"
+                )
+
+            # Existing values are NEVER overwritten. Conflicts are reported.
+            compare_fields = [
+                ("GRN Quantity", current_grn, uploaded_grn, "number"),
+                ("Delivery/Cancel Date", current_delivery_date, uploaded_delivery_date, "text"),
+                ("Delivery Remarks", current_delivery_remarks, uploaded_delivery_remarks, "text"),
+                ("Short Delivered", current_short, uploaded_short, "number"),
+                ("MIR No.", current_mir, uploaded_mir, "text"),
+                ("Sumit Invoice upload", current_sumit, uploaded_sumit, "text"),
+            ]
+
+            for field, cur_v, up_v, typ in compare_fields:
+                if typ == "number":
+                    cur_has = abs(number_value(cur_v)) > 0.000001
+                    up_has = abs(number_value(up_v)) > 0.000001
+                    different = abs(number_value(cur_v) - number_value(up_v)) > 0.000001
+                else:
+                    cur_has = not is_blank(cur_v)
+                    up_has = not is_blank(up_v)
+                    different = norm_compare_text(cur_v) != norm_compare_text(up_v)
+
+                if cur_has and up_has and different:
+                    issues.append(
+                        f"{field} conflict: existing Main value will NOT be overwritten"
+                    )
+                elif cur_has and not up_has:
+                    issues.append(
+                        f"{field} is blank in Excel but already exists in Main"
+                    )
+                elif not cur_has and up_has:
+                    issues.append(
+                        f"{field} is available in Excel but blank in Main (review only; not applied)"
+                    )
+
+            if issues:
+                severity = "REVIEW"
+
+        if duplicate_counts.get(key, 0) > 1 and severity == "OK":
+            severity = "REVIEW"
+
+        report_rows.append({
+            "Excel Row": int(r["_Excel Row"]),
+            "Status": severity,
+            "Issues Found": " | ".join(issues) if issues else "No issue found",
+            "PO Number": po_no,
+            "Invoice No.": invoice_no,
+            "Product/Item No": sku,
+            "Ledger Name": ledger,
+            "Item Description": desc,
+            "Main Match Count": match_count,
+
+            "Excel Bill Qty": uploaded_bill,
+            "Main Billed Qty": current_bill,
+
+            "Excel GRN Qty": uploaded_grn,
+            "Main GRN Qty": current_grn,
+
+            "Excel Delivery/Cancel Date": uploaded_delivery_date,
+            "Main Delivery/Cancel Date": current_delivery_date,
+
+            "Excel Delivery Remarks": uploaded_delivery_remarks,
+            "Main Delivery Remarks": current_delivery_remarks,
+
+            "Excel Short Delivered": uploaded_short,
+            "Main Short Delivered": current_short,
+
+            "Excel MIR No.": uploaded_mir,
+            "Main MIR No.": current_mir,
+
+            "Excel Sumit Invoice upload": uploaded_sumit,
+            "Main Sumit Invoice upload": current_sumit,
+        })
+
+    report = pd.DataFrame(report_rows)
+
+    summary = {
+        "source_rows": len(source),
+        "ok_rows": int((report["Status"] == "OK").sum()) if not report.empty else 0,
+        "review_rows": int((report["Status"] == "REVIEW").sum()) if not report.empty else 0,
+        "error_rows": int((report["Status"] == "ERROR").sum()) if not report.empty else 0,
+        "not_found_rows": int(report["Issues Found"].str.contains(
+            "No matching PO \\+ Invoice \\+ Product/Item", regex=True
+        ).sum()) if not report.empty else 0,
+        "duplicate_source_rows": int(report["Issues Found"].str.contains(
+            "Duplicate key in uploaded Excel", regex=False
+        ).sum()) if not report.empty else 0,
+    }
+
+    return report, summary
+
+
 def safe_table_count(table_name):
     try:
         d = read_sql(f"SELECT COUNT(*) AS n FROM {table_name}")
@@ -9668,9 +9960,9 @@ full_name = text_value(st.session_state.get("auth_full_name"))
 
 with st.sidebar:
     st.caption(
-        "Database: Supabase PostgreSQL • V63.50 MOR GRN EXCEL UPLOAD"
+        "Database: Supabase PostgreSQL • V63.51 MOR VALIDATION ONLY"
         if USE_POSTGRES else
-        "Database: Local SQLite • V63.50 MOR GRN EXCEL UPLOAD"
+        "Database: Local SQLite • V63.51 MOR VALIDATION ONLY"
     )
     st.markdown("## Control Tower")
 
@@ -10210,56 +10502,155 @@ if page == "Main Reconciliation Dashboard":
                 width="stretch"
             )
 
-        st.markdown("#### Upload MOR Master File — Bulk GRN Update")
+        st.markdown("#### Upload MOR Master File — Validation Only")
         st.caption(
-            "Upload the MOR Master Excel in the same format shared with the team. "
-            "The app matches PO + Invoice + Product/Item No and updates GRN Quantity, "
-            "Delivery/Cancel Date, Delivery Remarks, Short Delivered, MIR No. and "
-            "Sumit Invoice upload in Main Reconciliation. Existing GRN No./Date are preserved."
+            "This upload does NOT update or overwrite Main Reconciliation. "
+            "It compares the MOR Excel against the current Main Reconciliation and "
+            "shows missing keys, quantity mismatches, duplicate rows and field conflicts. "
+            "Existing GRN / delivery data remains unchanged."
         )
 
         uploaded_mor_grn = st.file_uploader(
-            "Upload MOR Master File",
+            "Upload MOR Master File for Validation",
             type=["xlsx","xls"],
             key=f"mor_grn_upload_{('_'.join(selected_pos) if selected_pos else 'ALL')}"
         )
 
         if uploaded_mor_grn is not None:
             if st.button(
-                "Apply MOR GRN Updates",
+                "Validate MOR Master File",
                 type="primary",
-                key=f"apply_mor_grn_{('_'.join(selected_pos) if selected_pos else 'ALL')}"
+                key=f"validate_mor_grn_{('_'.join(selected_pos) if selected_pos else 'ALL')}"
             ):
                 try:
                     mor_source_df = read_excel(uploaded_mor_grn.getvalue())
-                    mor_working_df = prepare_mor_master_grn_working(mor_source_df)
-
-                    saved, audited = save_grn_working_changes(
-                        mor_working_df,
-                        user,
-                        f"MOR Master File upload: {uploaded_mor_grn.name}"
+                    mor_report, mor_summary = validate_mor_master_against_reconciliation(
+                        mor_source_df
                     )
+
+                    st.session_state["mor_validation_report"] = mor_report
+                    st.session_state["mor_validation_summary"] = mor_summary
+                    st.session_state["mor_validation_file"] = uploaded_mor_grn.name
 
                     try:
                         audit_event(
-                            "BULK_GRN_UPDATE",
+                            "VALIDATE_MOR_FILE",
                             "MOR Master File",
                             record_key=uploaded_mor_grn.name,
-                            after_value=f"rows_prepared={len(mor_working_df)}; rows_saved={saved}",
-                            details=f"{audited} GRN audit change(s) logged."
+                            after_value=(
+                                f"source_rows={mor_summary['source_rows']}; "
+                                f"ok={mor_summary['ok_rows']}; "
+                                f"review={mor_summary['review_rows']}; "
+                                f"errors={mor_summary['error_rows']}"
+                            ),
+                            details="Validation only. No Main Reconciliation values were changed."
                         )
                     except Exception:
                         pass
 
-                    st.success(
-                        f"MOR Master File applied successfully: "
-                        f"{len(mor_working_df):,} row(s) matched/prepared, "
-                        f"{saved:,} reconciliation row(s) updated, "
-                        f"{audited:,} audit change(s) logged."
-                    )
-                    st.rerun()
                 except Exception as e:
-                    st.error(f"Could not apply MOR Master File: {e}")
+                    st.error(f"Could not validate MOR Master File: {e}")
+
+        mor_report = st.session_state.get("mor_validation_report")
+        mor_summary = st.session_state.get("mor_validation_summary")
+        mor_file_name = st.session_state.get("mor_validation_file","")
+
+        if isinstance(mor_report, pd.DataFrame) and mor_summary:
+            if mor_file_name:
+                st.caption(f"Validation result for: {mor_file_name}")
+
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Excel Rows", f"{mor_summary['source_rows']:,}")
+            m2.metric("No Issue", f"{mor_summary['ok_rows']:,}")
+            m3.metric("Review", f"{mor_summary['review_rows']:,}")
+            m4.metric("Errors", f"{mor_summary['error_rows']:,}")
+
+            if mor_summary["review_rows"] or mor_summary["error_rows"]:
+                st.warning(
+                    "Issues were found in the uploaded Excel. "
+                    "No Main Reconciliation data has been changed."
+                )
+            else:
+                st.success(
+                    "No validation issue found. "
+                    "Main Reconciliation has still not been modified."
+                )
+
+            issue_filter = st.selectbox(
+                "Validation View",
+                ["Issues Only", "Errors Only", "Review Only", "All Rows"],
+                key="mor_validation_view"
+            )
+
+            show_report = mor_report.copy()
+            if issue_filter == "Issues Only":
+                show_report = show_report[
+                    show_report["Status"].isin(["ERROR","REVIEW"])
+                ].copy()
+            elif issue_filter == "Errors Only":
+                show_report = show_report[
+                    show_report["Status"].eq("ERROR")
+                ].copy()
+            elif issue_filter == "Review Only":
+                show_report = show_report[
+                    show_report["Status"].eq("REVIEW")
+                ].copy()
+
+            mor_search = st.text_input(
+                "Search Validation Results",
+                placeholder="Search PO, invoice, SKU, issue...",
+                key="mor_validation_search"
+            ).strip()
+
+            if mor_search and not show_report.empty:
+                searchable = show_report.fillna("").astype(str).apply(
+                    lambda c: c.str.lower()
+                )
+                mask = searchable.apply(
+                    lambda c: c.str.contains(mor_search.lower(), regex=False)
+                ).any(axis=1)
+                show_report = show_report.loc[mask].copy()
+
+            st.dataframe(
+                show_report,
+                width="stretch",
+                hide_index=True,
+                height=min(650, 75 + min(len(show_report), 16) * 34)
+            )
+
+            # Download the full validation report, not only the filtered screen.
+            out_mor = io.BytesIO()
+            with pd.ExcelWriter(out_mor, engine="openpyxl") as writer:
+                mor_report.to_excel(
+                    writer,
+                    index=False,
+                    sheet_name="MOR Validation Report"
+                )
+                ws = writer.book["MOR Validation Report"]
+                ws.freeze_panes = "A2"
+
+                summary_df = pd.DataFrame([
+                    ["Source Excel Rows", mor_summary["source_rows"]],
+                    ["No Issue Rows", mor_summary["ok_rows"]],
+                    ["Review Rows", mor_summary["review_rows"]],
+                    ["Error Rows", mor_summary["error_rows"]],
+                    ["No Match Rows", mor_summary["not_found_rows"]],
+                    ["Duplicate Source-Key Rows", mor_summary["duplicate_source_rows"]],
+                    ["Main Reconciliation Updated?", "NO"],
+                ], columns=["Metric","Value"])
+                summary_df.to_excel(
+                    writer,
+                    index=False,
+                    sheet_name="Summary"
+                )
+
+            st.download_button(
+                "Download MOR Validation Report",
+                out_mor.getvalue(),
+                "MOR_Master_Validation_Report.xlsx",
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="download_mor_validation_report"
+            )
 
         st.markdown("#### Upload Completed GRN Working Sheet — Final Override")
         uploaded_grn_work = st.file_uploader(
