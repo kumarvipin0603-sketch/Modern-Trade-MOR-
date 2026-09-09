@@ -2100,9 +2100,14 @@ def parse_customer_po_excel_by_mapping(raw, source_file, upload_id):
             po_value = number_value(values.get("PO Value"))
             unit_price = number_value(values.get("PO Unit Price"))
             description_po = text_value(values.get("Item Description"))
+            ean_po = text_value(
+                values.get("EAN")
+                or values.get("EAN/BarCode")
+                or values.get("Barcode")
+            )
 
-            erp, master_desc, master_price = resolve_po_erp_item(
-                con, ledger, customer_item
+            erp, master_desc, master_price = resolve_po_erp_item_with_ean(
+                con, ledger, customer_item, ean_po
             )
             if not erp:
                 unmapped += 1
@@ -2150,6 +2155,7 @@ def parse_customer_po_excel_by_mapping(raw, source_file, upload_id):
                 "PO Expiry/DELIVERY DATE": header.get("PO Expiry/DELIVERY DATE",""),
                 "Ledger": ledger,
                 "Customer Item": customer_item,
+                "EAN": ean_po,
                 "ERP Item": erp,
                 "PO Qty": qty,
                 "PO Value": po_value,
@@ -2547,35 +2553,62 @@ def repair_pdf_po_header(profile, full_text, header):
 
     elif "CP WHOLESALE" in p or "LOTS" in p:
         m = re.search(r"P\.O\s+No\s*:\s*([0-9]+)", full_text, re.I)
-        if m: h["PO No"] = m.group(1)
-        m = re.search(r"Date\s+of\s+creation\s*:\s*([0-9−–-]+)", full_text, re.I)
-        if m: h["PO Date"] = _header_date(m.group(1))
-        m = re.search(r"Expiry\s+Date\s*:\s*([0-9−–-]+)", full_text, re.I)
-        if m: h["PO Expiry/DELIVERY DATE"] = _header_date(m.group(1))
+        if m:
+            h["PO No"] = m.group(1)
+
         m = re.search(
-            r"Bill[−–-]To\s+Address/Ship\s+to\s+Address\s+Store/Warehouse\s+(.+?)(?=\s+Email\s*:)",
-            full_text, re.I|re.S
+            r"Date\s+of\s+creation\s*:\s*([0-9−–-]+)",
+            full_text, re.I
         )
-        if m: h["Ship to Location"] = _clean_po_address(m.group(1))
+        if m:
+            h["PO Date"] = _header_date(m.group(1))
+
+        m = re.search(
+            r"Expiry\s+Date\s*:\s*([0-9−–-]+)",
+            full_text, re.I
+        )
+        if m:
+            h["PO Expiry/DELIVERY DATE"] = _header_date(m.group(1))
+
+        # LOTS/CP Wholesale places the complete destination in the first
+        # Bill-To/Ship-to block. Capture ONLY that block so vendor / registered
+        # office PINs cannot be mistaken for the destination PIN.
         bill = re.search(
-            r"Bill[−–-]To\s+Address/Ship\s+to\s+Address(.+?)(?=Bill[−–-]from\s+Address)",
-            full_text, re.I|re.S
+            r"Bill[−–-]To\s+Address/Ship\s+to\s+Address"
+            r"(.*?)(?=Bill[−–-]from\s+Address)",
+            full_text,
+            re.I | re.S
         )
         if bill:
-            g = re.search(r"GSTIN\s+No\s*:\s*([0-9A-Z]{15})", bill.group(1), re.I)
+            bill_text = bill.group(1)
+
+            # Keep warehouse name + address + PIN together for Ship-to Master.
+            h["Ship to Location"] = _clean_po_address(bill_text)
+
+            g = re.search(
+                r"GSTIN\s+No\s*:\s*([0-9A-Z]{15})",
+                bill_text,
+                re.I
+            )
             if g:
                 h["Ship to GST no as per PO"] = g.group(1).upper()
 
-        if not extract_pin_from_text(h.get("Ship to Location","")):
-            name = re.search(
-                r"Name:\s*(CPWI\s+Pvt\.Ltd\.[−–-][A-Z]+\s*\d+)",
-                full_text, re.I
-            )
-            pin = re.search(r"(?<!\d)(110044|110092)(?!\d)", full_text)
-            if pin:
+            # Explicit destination PIN safeguard.
+            pin = extract_pin_from_text(bill_text)
+            if pin and pin not in h["Ship to Location"]:
                 h["Ship to Location"] = _clean_po_address(
-                    f"{name.group(1) if name else 'CP Wholesale'} {pin.group(1)}"
+                    f"{h['Ship to Location']} PIN {pin}"
                 )
+
+        # Alternate compact extraction where Bill-from marker is missing.
+        if not extract_pin_from_text(h.get("Ship to Location","")):
+            m = re.search(
+                r"Store/Warehouse\s+Name:\s*(.+?)(?=\s+Bill[−–-]from|\s+Vendor\s+Name:)",
+                full_text,
+                re.I | re.S
+            )
+            if m:
+                h["Ship to Location"] = _clean_po_address(m.group(1))
 
     elif "METRO" in p:
         m = re.search(r"PO\s+NO\.\s*:\s*([0-9]+)", full_text, re.I)
@@ -2869,6 +2902,66 @@ def resolve_po_erp_item(con, ledger, customer_item):
     """
     erp, desc, price = lookup_master(con, ledger, customer_item)
     return text_value(erp), text_value(desc), number_value(price)
+
+
+def resolve_po_erp_item_with_ean(con, ledger, customer_item, ean=""):
+    """
+    Resolve ERP item for customer PO lines.
+
+    Priority:
+      1) Existing Customer Item Code logic.
+      2) Exact Ledger + EAN from Customer SKU & Price Master.
+      3) Unique EAN across the master.
+
+    This is especially useful for CP Wholesale / LOTS where the PO carries
+    both Item No and EAN, while some master records may have been maintained
+    primarily by EAN.
+    """
+    erp, desc, price = resolve_po_erp_item(con, ledger, customer_item)
+    if erp:
+        return erp, desc, price
+
+    ean_k = re.sub(r"\\D+", "", text_value(ean))
+    if not ean_k:
+        return "", "", 0.0
+
+    ledger_k = canonical_ledger_name(ledger)
+
+    rows = con.execute(
+        """SELECT ledger_name,erp_item_code,item_description,price
+           FROM sku_master
+           WHERE REGEXP_REPLACE(COALESCE(ean,''),'[^0-9]','','g')=?""",
+        (ean_k,)
+    ).fetchall() if USE_POSTGRES else con.execute(
+        """SELECT ledger_name,erp_item_code,item_description,price
+           FROM sku_master
+           WHERE REPLACE(REPLACE(REPLACE(COALESCE(ean,''),' ',''),'-',''),'.0','')=?""",
+        (ean_k,)
+    ).fetchall()
+
+    if not rows:
+        return "", "", 0.0
+
+    exact = [
+        r for r in rows
+        if canonical_ledger_name(r[0]) == ledger_k
+        and text_value(r[1]).strip()
+    ]
+    if len(exact) == 1:
+        r = exact[0]
+        return text_value(r[1]), text_value(r[2]), number_value(r[3])
+
+    erps = {}
+    for r in rows:
+        erp_code = text_value(r[1]).strip()
+        if erp_code:
+            erps[erp_code.upper()] = r
+
+    if len(erps) == 1:
+        r = next(iter(erps.values()))
+        return text_value(r[1]), text_value(r[2]), number_value(r[3])
+
+    return "", "", 0.0
 
 
 def backfill_po_erp_items_from_master():
@@ -9384,9 +9477,9 @@ full_name = text_value(st.session_state.get("auth_full_name"))
 
 with st.sidebar:
     st.caption(
-        "Database: Supabase PostgreSQL • V63.47 ZEPTO GRN FIX"
+        "Database: Supabase PostgreSQL • V63.48 CP WHOLESALE SHIP-TO + SKU FIX"
         if USE_POSTGRES else
-        "Database: Local SQLite • V63.47 ZEPTO GRN FIX"
+        "Database: Local SQLite • V63.48 CP WHOLESALE SHIP-TO + SKU FIX"
     )
     st.markdown("## Control Tower")
 
