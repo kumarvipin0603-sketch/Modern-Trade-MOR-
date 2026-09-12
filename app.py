@@ -10742,9 +10742,9 @@ full_name = text_value(st.session_state.get("auth_full_name"))
 
 with st.sidebar:
     st.caption(
-        "Database: Supabase PostgreSQL • V63.59 FLEXIBLE TEAM GRN UPLOAD"
+        "Database: Supabase PostgreSQL • V63.60 FAST GRN BULK UPLOAD"
         if USE_POSTGRES else
-        "Database: Local SQLite • V63.59 FLEXIBLE TEAM GRN UPLOAD"
+        "Database: Local SQLite • V63.60 FAST GRN BULK UPLOAD"
     )
     st.markdown("## Control Tower")
 
@@ -12406,116 +12406,140 @@ elif page == "GRN Bulk Upload":
     st.subheader("GRN Bulk Upload — Team Excel")
     st.caption(
         "Upload the same GRN Excel format your team already maintains on desktop. "
-        "The dashboard will auto-detect columns, allow manual mapping, validate against "
-        "Main Reconciliation and highlight discrepancies before any update."
+        "This page now loads Main Reconciliation only when you click Validate, "
+        "so opening the page remains fast."
     )
 
-    current_grn = full_main_dashboard()
+    st.markdown("#### 1. Upload Team GRN Excel")
 
-    if current_grn is None or current_grn.empty:
-        st.info("Main Reconciliation has no rows available for GRN matching.")
-    else:
-        st.markdown("#### 1. Upload Team GRN Excel")
+    team_grn_file = st.file_uploader(
+        "Upload your existing GRN Excel",
+        type=["xlsx","xls"],
+        key="team_grn_flexible_upload"
+    )
 
-        team_grn_file = st.file_uploader(
-            "Upload your existing GRN Excel",
-            type=["xlsx","xls"],
-            key="team_grn_flexible_upload"
-        )
+    if team_grn_file is not None:
+        try:
+            # Cache parsed upload in session so Streamlit reruns caused by
+            # dropdowns/radio buttons do not repeatedly parse the workbook.
+            file_bytes = team_grn_file.getvalue()
+            file_hash = hashlib.sha256(file_bytes).hexdigest()
 
-        if team_grn_file is not None:
-            try:
-                source_df = read_excel(team_grn_file.getvalue())
+            if st.session_state.get("flex_grn_upload_hash") != file_hash:
+                with st.spinner("Reading GRN Excel..."):
+                    source_df = read_excel(file_bytes)
 
-                if source_df is None or source_df.empty:
-                    st.error("Uploaded Excel has no data rows.")
-                    st.stop()
+                st.session_state["flex_grn_upload_hash"] = file_hash
+                st.session_state["flex_grn_source_df"] = source_df
 
-                st.caption(
-                    f"Detected {len(source_df):,} row(s) and "
-                    f"{len(source_df.columns):,} column(s)."
+                # Clear validation from any previous workbook.
+                for k in [
+                    "flex_grn_normalized","flex_grn_validation",
+                    "flex_grn_summary","flex_grn_mapping",
+                    "flex_grn_file_name","flex_grn_current_snapshot"
+                ]:
+                    st.session_state.pop(k, None)
+            else:
+                source_df = st.session_state.get(
+                    "flex_grn_source_df",
+                    pd.DataFrame()
                 )
 
-                with st.expander("Preview uploaded Excel", expanded=False):
-                    st.dataframe(
-                        source_df.head(20),
-                        width="stretch",
-                        hide_index=True
+            if source_df is None or source_df.empty:
+                st.error("Uploaded Excel has no data rows.")
+                st.stop()
+
+            st.caption(
+                f"Detected {len(source_df):,} row(s) and "
+                f"{len(source_df.columns):,} column(s)."
+            )
+
+            with st.expander("Preview uploaded Excel", expanded=False):
+                st.dataframe(
+                    source_df.head(20),
+                    width="stretch",
+                    hide_index=True
+                )
+
+            st.markdown("#### 2. Confirm Column Mapping")
+            st.caption(
+                "Auto-detected mappings are preselected. If your team uses different "
+                "column names, select the correct uploaded column. Extra columns are ignored."
+            )
+
+            auto_map = auto_detect_grn_column_map(source_df)
+            uploaded_columns = ["— Not mapped —"] + [str(c) for c in source_df.columns]
+
+            required_fields = ["Po Number","Invoice No","Product/Item No"]
+            optional_fields = GRN_TEAM_UPLOAD_FIELDS
+            mapping = {}
+
+            c1, c2, c3 = st.columns(3)
+            required_containers = [c1, c2, c3]
+
+            for i, target in enumerate(required_fields):
+                detected = auto_map.get(target)
+                default_index = (
+                    uploaded_columns.index(str(detected))
+                    if detected is not None and str(detected) in uploaded_columns
+                    else 0
+                )
+                with required_containers[i]:
+                    selected = st.selectbox(
+                        f"{target} *",
+                        uploaded_columns,
+                        index=default_index,
+                        key=f"grn_map_required_{target}"
                     )
+                mapping[target] = None if selected == "— Not mapped —" else selected
 
-                st.markdown("#### 2. Confirm Column Mapping")
-                st.caption(
-                    "Auto-detected mappings are preselected. If your team uses different "
-                    "column names, select the correct uploaded column here. Extra columns "
-                    "are ignored."
-                )
+            st.caption("* Required for matching.")
 
-                auto_map = auto_detect_grn_column_map(source_df)
-                uploaded_columns = ["— Not mapped —"] + [str(c) for c in source_df.columns]
+            with st.expander("Map GRN update fields", expanded=True):
+                oc1, oc2, oc3 = st.columns(3)
+                optional_containers = [oc1, oc2, oc3]
 
-                required_fields = ["Po Number","Invoice No","Product/Item No"]
-                optional_fields = GRN_TEAM_UPLOAD_FIELDS
-
-                mapping = {}
-
-                c1, c2, c3 = st.columns(3)
-                required_containers = [c1, c2, c3]
-
-                for i, target in enumerate(required_fields):
+                for i, target in enumerate(optional_fields):
                     detected = auto_map.get(target)
                     default_index = (
                         uploaded_columns.index(str(detected))
                         if detected is not None and str(detected) in uploaded_columns
                         else 0
                     )
-                    with required_containers[i]:
+                    with optional_containers[i % 3]:
                         selected = st.selectbox(
-                            f"{target} *",
+                            target,
                             uploaded_columns,
                             index=default_index,
-                            key=f"grn_map_required_{target}"
+                            key=f"grn_map_optional_{target}"
                         )
-                    mapping[target] = None if selected == "— Not mapped —" else selected
-
-                st.caption("* Required for matching.")
-
-                with st.expander("Map GRN update fields", expanded=True):
-                    oc1, oc2, oc3 = st.columns(3)
-                    optional_containers = [oc1, oc2, oc3]
-
-                    for i, target in enumerate(optional_fields):
-                        detected = auto_map.get(target)
-                        default_index = (
-                            uploaded_columns.index(str(detected))
-                            if detected is not None and str(detected) in uploaded_columns
-                            else 0
-                        )
-                        with optional_containers[i % 3]:
-                            selected = st.selectbox(
-                                target,
-                                uploaded_columns,
-                                index=default_index,
-                                key=f"grn_map_optional_{target}"
-                            )
-                        mapping[target] = (
-                            None if selected == "— Not mapped —" else selected
-                        )
-
-                missing_required = [
-                    f for f in required_fields if not mapping.get(f)
-                ]
-
-                if missing_required:
-                    st.error(
-                        "Map these required fields before validation: "
-                        + ", ".join(missing_required)
+                    mapping[target] = (
+                        None if selected == "— Not mapped —" else selected
                     )
-                else:
-                    if st.button(
-                        "Validate Against Main Reconciliation",
-                        type="primary",
-                        key="validate_flexible_grn"
+
+            missing_required = [
+                f for f in required_fields if not mapping.get(f)
+            ]
+
+            if missing_required:
+                st.error(
+                    "Map these required fields before validation: "
+                    + ", ".join(missing_required)
+                )
+            else:
+                if st.button(
+                    "Validate Against Main Reconciliation",
+                    type="primary",
+                    key="validate_flexible_grn"
+                ):
+                    with st.spinner(
+                        "Loading reconciliation data and validating uploaded GRN rows..."
                     ):
+                        # IMPORTANT PERFORMANCE FIX:
+                        # available_main_dashboard() is vectorized; the older
+                        # full_main_dashboard() loops PO-by-PO across all history.
+                        current_grn = available_main_dashboard()
+
                         normalized_df, validation_df, validation_summary, current_groups, used_map = (
                             validate_team_grn_upload(
                                 source_df,
@@ -12524,251 +12548,267 @@ elif page == "GRN Bulk Upload":
                             )
                         )
 
-                        st.session_state["flex_grn_normalized"] = normalized_df
-                        st.session_state["flex_grn_validation"] = validation_df
-                        st.session_state["flex_grn_summary"] = validation_summary
-                        st.session_state["flex_grn_mapping"] = used_map
-                        st.session_state["flex_grn_file_name"] = team_grn_file.name
+                    st.session_state["flex_grn_normalized"] = normalized_df
+                    st.session_state["flex_grn_validation"] = validation_df
+                    st.session_state["flex_grn_summary"] = validation_summary
+                    st.session_state["flex_grn_mapping"] = used_map
+                    st.session_state["flex_grn_file_name"] = team_grn_file.name
 
-                validation_df = st.session_state.get("flex_grn_validation")
-                validation_summary = st.session_state.get("flex_grn_summary")
-                normalized_df = st.session_state.get("flex_grn_normalized")
+                    # Store only the columns needed to rebuild matching groups
+                    # on later Streamlit reruns. Do NOT re-run reconciliation.
+                    keep_cols = [
+                        c for c in (
+                            ["Po Number","Invoice No","Product/Item No",
+                             "Ledger Name","Item Description","Billed Qty"]
+                            + GRN_TEAM_UPLOAD_FIELDS
+                        )
+                        if c in current_grn.columns
+                    ]
+                    st.session_state["flex_grn_current_snapshot"] = (
+                        current_grn[keep_cols].copy()
+                    )
 
+            validation_df = st.session_state.get("flex_grn_validation")
+            validation_summary = st.session_state.get("flex_grn_summary")
+            normalized_df = st.session_state.get("flex_grn_normalized")
+            current_snapshot = st.session_state.get("flex_grn_current_snapshot")
+
+            if (
+                isinstance(validation_df, pd.DataFrame)
+                and isinstance(normalized_df, pd.DataFrame)
+                and isinstance(current_snapshot, pd.DataFrame)
+                and validation_summary
+            ):
+                # Rebuild groups from the already-cached validation snapshot.
+                # No DB/reconciliation reload on dropdown/radio/checkbox reruns.
+                current_for_groups = current_snapshot.copy()
+                for c in ["Po Number","Invoice No","Product/Item No"] + GRN_TEAM_UPLOAD_FIELDS:
+                    if c not in current_for_groups.columns:
+                        current_for_groups[c] = (
+                            0 if c in ("GRN Qty","Short Delivered") else ""
+                        )
+
+                current_for_groups["_K"] = (
+                    current_for_groups["Po Number"].fillna("").astype(str).str.strip().str.upper()
+                    + "||"
+                    + current_for_groups["Invoice No"].fillna("").astype(str).str.strip().str.upper()
+                    + "||"
+                    + current_for_groups["Product/Item No"].fillna("").astype(str).str.strip().str.upper()
+                )
+                current_groups = {
+                    k: g.copy()
+                    for k, g in current_for_groups.groupby("_K", dropna=False)
+                    if str(k).strip("|")
+                }
+
+                st.markdown("#### 3. Validation Result")
+
+                v1, v2, v3, v4, v5 = st.columns(5)
+                v1.metric("Excel Rows", f"{validation_summary['total']:,}")
+                v2.metric("Ready", f"{validation_summary['ready']:,}")
+                v3.metric("Review", f"{validation_summary['review']:,}")
+                v4.metric("Errors", f"{validation_summary['errors']:,}")
+                v5.metric("Not Found", f"{validation_summary['not_found']:,}")
+
+                if validation_summary["errors"]:
+                    st.error(
+                        "ERROR rows will never be updated. Correct the Excel or matching "
+                        "data and upload again."
+                    )
+                if validation_summary["review"]:
+                    st.warning(
+                        "REVIEW rows match Main Reconciliation but contain values different "
+                        "from data already present in the dashboard."
+                    )
                 if (
-                    isinstance(validation_df, pd.DataFrame)
-                    and isinstance(normalized_df, pd.DataFrame)
-                    and validation_summary
+                    validation_summary["errors"] == 0
+                    and validation_summary["review"] == 0
                 ):
-                    # Rebuild current_groups against live current dashboard.
-                    current_for_groups = current_grn.copy()
-                    for c in ["Po Number","Invoice No","Product/Item No"] + GRN_TEAM_UPLOAD_FIELDS:
-                        if c not in current_for_groups.columns:
-                            current_for_groups[c] = (
-                                0 if c in ("GRN Qty","Short Delivered") else ""
-                            )
+                    st.success("All rows are matched and ready.")
 
-                    current_for_groups["_K"] = (
-                        current_for_groups["Po Number"].fillna("").astype(str).str.strip().str.upper()
-                        + "||"
-                        + current_for_groups["Invoice No"].fillna("").astype(str).str.strip().str.upper()
-                        + "||"
-                        + current_for_groups["Product/Item No"].fillna("").astype(str).str.strip().str.upper()
+                view = st.selectbox(
+                    "Show validation rows",
+                    [
+                        "Errors + Review",
+                        "Errors Only",
+                        "Review Only",
+                        "Ready Only",
+                        "All Rows",
+                    ],
+                    key="flex_grn_validation_view"
+                )
+
+                show_df = validation_df.copy()
+                if view == "Errors + Review":
+                    show_df = show_df[
+                        show_df["Status"].isin(["ERROR","REVIEW"])
+                    ]
+                elif view == "Errors Only":
+                    show_df = show_df[show_df["Status"].eq("ERROR")]
+                elif view == "Review Only":
+                    show_df = show_df[show_df["Status"].eq("REVIEW")]
+                elif view == "Ready Only":
+                    show_df = show_df[show_df["Status"].eq("READY")]
+
+                st.dataframe(
+                    show_df,
+                    width="stretch",
+                    hide_index=True,
+                    height=min(650, 90 + min(len(show_df), 16) * 34)
+                )
+
+                report_out = io.BytesIO()
+                with pd.ExcelWriter(report_out, engine="openpyxl") as writer:
+                    validation_df.to_excel(
+                        writer,
+                        index=False,
+                        sheet_name="Validation Report"
                     )
-                    current_groups = {
-                        k: g.copy()
-                        for k, g in current_for_groups.groupby("_K", dropna=False)
-                        if str(k).strip("|")
-                    }
+                    ws = writer.book["Validation Report"]
+                    ws.freeze_panes = "A2"
+                    ws.auto_filter.ref = ws.dimensions
 
-                    st.markdown("#### 3. Validation Result")
-
-                    v1, v2, v3, v4, v5 = st.columns(5)
-                    v1.metric("Excel Rows", f"{validation_summary['total']:,}")
-                    v2.metric("Ready", f"{validation_summary['ready']:,}")
-                    v3.metric("Review", f"{validation_summary['review']:,}")
-                    v4.metric("Errors", f"{validation_summary['errors']:,}")
-                    v5.metric("Not Found", f"{validation_summary['not_found']:,}")
-
-                    if validation_summary["errors"]:
-                        st.error(
-                            "ERROR rows will never be updated. Correct the Excel or matching "
-                            "data and upload again."
-                        )
-                    if validation_summary["review"]:
-                        st.warning(
-                            "REVIEW rows match Main Reconciliation but contain values different "
-                            "from data already present in the dashboard."
-                        )
-                    if (
-                        validation_summary["errors"] == 0
-                        and validation_summary["review"] == 0
-                    ):
-                        st.success("All rows are matched and ready.")
-
-                    view = st.selectbox(
-                        "Show validation rows",
+                    mapping_df = pd.DataFrame(
                         [
-                            "Errors + Review",
-                            "Errors Only",
-                            "Review Only",
-                            "Ready Only",
-                            "All Rows",
+                            [k, v or "NOT MAPPED"]
+                            for k, v in st.session_state.get(
+                                "flex_grn_mapping", {}
+                            ).items()
                         ],
-                        key="flex_grn_validation_view"
+                        columns=["Dashboard Field","Uploaded Excel Column"]
+                    )
+                    mapping_df.to_excel(
+                        writer,
+                        index=False,
+                        sheet_name="Column Mapping"
                     )
 
-                    show_df = validation_df.copy()
-                    if view == "Errors + Review":
-                        show_df = show_df[
-                            show_df["Status"].isin(["ERROR","REVIEW"])
-                        ]
-                    elif view == "Errors Only":
-                        show_df = show_df[show_df["Status"].eq("ERROR")]
-                    elif view == "Review Only":
-                        show_df = show_df[show_df["Status"].eq("REVIEW")]
-                    elif view == "Ready Only":
-                        show_df = show_df[show_df["Status"].eq("READY")]
+                st.download_button(
+                    "Download Discrepancy / Validation Report",
+                    report_out.getvalue(),
+                    "GRN_Discrepancy_Report.xlsx",
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key="flex_grn_download_report"
+                )
 
-                    st.dataframe(
-                        show_df,
-                        width="stretch",
-                        hide_index=True,
-                        height=min(650, 90 + min(len(show_df), 16) * 34)
+                st.markdown("#### 4. Choose Update Rule")
+
+                update_mode = st.radio(
+                    "Update mode",
+                    [
+                        "Fill blank GRN fields only",
+                        "Overwrite existing values after review",
+                    ],
+                    index=0,
+                    key="flex_grn_update_mode"
+                )
+
+                fill_blank_only = (
+                    update_mode == "Fill blank GRN fields only"
+                )
+
+                if fill_blank_only:
+                    st.info(
+                        "SAFE MODE: Existing non-blank dashboard values remain unchanged. "
+                        "Only blank/zero GRN fields are filled."
+                    )
+                else:
+                    st.warning(
+                        "OVERWRITE MODE: READY and REVIEW rows can update existing GRN "
+                        "fields where Excel contains a non-blank value. ERROR rows are excluded."
                     )
 
-                    report_out = io.BytesIO()
-                    with pd.ExcelWriter(report_out, engine="openpyxl") as writer:
-                        validation_df.to_excel(
-                            writer,
-                            index=False,
-                            sheet_name="Validation Report"
-                        )
-                        ws = writer.book["Validation Report"]
-                        ws.freeze_panes = "A2"
-                        ws.auto_filter.ref = ws.dimensions
+                prepared_updates = build_grn_update_dataframe(
+                    normalized_df,
+                    validation_df,
+                    current_groups,
+                    fill_blank_only=fill_blank_only
+                )
 
-                        mapping_df = pd.DataFrame(
-                            [
-                                [k, v or "NOT MAPPED"]
-                                for k, v in st.session_state.get(
-                                    "flex_grn_mapping", {}
-                                ).items()
-                            ],
-                            columns=["Dashboard Field","Uploaded Excel Column"]
-                        )
-                        mapping_df.to_excel(
-                            writer,
-                            index=False,
-                            sheet_name="Column Mapping"
-                        )
+                st.caption(
+                    f"{len(prepared_updates):,} reconciliation row(s) contain an actual "
+                    "change under the selected rule."
+                )
 
-                    st.download_button(
-                        "Download Discrepancy / Validation Report",
-                        report_out.getvalue(),
-                        "GRN_Discrepancy_Report.xlsx",
-                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        key="flex_grn_download_report"
-                    )
-
-                    st.markdown("#### 4. Choose Update Rule")
-
-                    update_mode = st.radio(
-                        "Update mode",
-                        [
-                            "Fill blank GRN fields only",
-                            "Overwrite existing values after review",
-                        ],
-                        index=0,
-                        key="flex_grn_update_mode"
-                    )
-
-                    fill_blank_only = (
-                        update_mode == "Fill blank GRN fields only"
-                    )
-
-                    if fill_blank_only:
-                        st.info(
-                            "SAFE MODE: Existing non-blank dashboard values remain unchanged. "
-                            "Only blank/zero GRN fields are filled. REVIEW rows with conflicting "
-                            "existing values are not overwritten."
-                        )
-                    else:
-                        st.warning(
-                            "OVERWRITE MODE: READY and REVIEW rows can update existing GRN "
-                            "fields where the Excel contains a non-blank value. ERROR rows are "
-                            "always excluded. Blank Excel cells never erase dashboard values."
-                        )
-
-                    prepared_updates = build_grn_update_dataframe(
-                        normalized_df,
-                        validation_df,
-                        current_groups,
-                        fill_blank_only=fill_blank_only
-                    )
-
-                    st.caption(
-                        f"{len(prepared_updates):,} reconciliation row(s) contain an actual "
-                        "change under the selected rule."
-                    )
-
-                    if not prepared_updates.empty:
-                        with st.expander(
-                            "Preview exactly what will be sent to Main Reconciliation",
-                            expanded=False
-                        ):
-                            st.dataframe(
-                                prepared_updates,
-                                width="stretch",
-                                hide_index=True,
-                                height=min(
-                                    600,
-                                    90 + min(len(prepared_updates), 14) * 34
-                                )
-                            )
-
-                    confirm = st.checkbox(
-                        "I have reviewed the validation/discrepancies and approve this update.",
-                        key="flex_grn_confirm"
-                    )
-
-                    if st.button(
-                        "Update Main Reconciliation",
-                        type="primary",
-                        disabled=(
-                            not confirm
-                            or prepared_updates.empty
-                        ),
-                        key="flex_grn_apply"
+                if not prepared_updates.empty:
+                    with st.expander(
+                        "Preview exactly what will be updated",
+                        expanded=False
                     ):
-                        file_name = st.session_state.get(
-                            "flex_grn_file_name",
-                            team_grn_file.name
-                        )
-                        reason = (
-                            f"Flexible Team GRN Excel: {file_name} | {update_mode}"
+                        st.dataframe(
+                            prepared_updates,
+                            width="stretch",
+                            hide_index=True,
+                            height=min(
+                                600,
+                                90 + min(len(prepared_updates), 14) * 34
+                            )
                         )
 
+                confirm = st.checkbox(
+                    "I have reviewed the validation/discrepancies and approve this update.",
+                    key="flex_grn_confirm"
+                )
+
+                if st.button(
+                    "Update Main Reconciliation",
+                    type="primary",
+                    disabled=(
+                        not confirm
+                        or prepared_updates.empty
+                    ),
+                    key="flex_grn_apply"
+                ):
+                    file_name = st.session_state.get(
+                        "flex_grn_file_name",
+                        team_grn_file.name
+                    )
+                    reason = (
+                        f"Flexible Team GRN Excel: {file_name} | {update_mode}"
+                    )
+
+                    with st.spinner("Updating matched GRN rows..."):
                         saved, audited = save_grn_working_changes(
                             prepared_updates,
                             user,
                             reason
                         )
 
-                        try:
-                            audit_event(
-                                "BULK_GRN_UPDATE",
-                                "Flexible Team GRN Upload",
-                                record_key=file_name,
-                                after_value=(
-                                    f"total={validation_summary['total']}; "
-                                    f"ready={validation_summary['ready']}; "
-                                    f"review={validation_summary['review']}; "
-                                    f"errors={validation_summary['errors']}; "
-                                    f"prepared={len(prepared_updates)}; "
-                                    f"saved={saved}; audited={audited}"
-                                ),
-                                details=update_mode
-                            )
-                        except Exception:
-                            pass
-
-                        st.success(
-                            f"Update completed: {saved:,} reconciliation row(s) saved and "
-                            f"{audited:,} field change(s) recorded against User ID {user}."
+                    try:
+                        audit_event(
+                            "BULK_GRN_UPDATE",
+                            "Flexible Team GRN Upload",
+                            record_key=file_name,
+                            after_value=(
+                                f"total={validation_summary['total']}; "
+                                f"ready={validation_summary['ready']}; "
+                                f"review={validation_summary['review']}; "
+                                f"errors={validation_summary['errors']}; "
+                                f"prepared={len(prepared_updates)}; "
+                                f"saved={saved}; audited={audited}"
+                            ),
+                            details=update_mode
                         )
+                    except Exception:
+                        pass
 
-                        for k in [
-                            "flex_grn_normalized","flex_grn_validation",
-                            "flex_grn_summary","flex_grn_mapping",
-                            "flex_grn_file_name"
-                        ]:
-                            st.session_state.pop(k, None)
+                    st.success(
+                        f"Update completed: {saved:,} reconciliation row(s) saved and "
+                        f"{audited:,} field change(s) recorded against User ID {user}."
+                    )
 
-                        invalidate_dashboard_cache()
-                        st.rerun()
+                    for k in [
+                        "flex_grn_normalized","flex_grn_validation",
+                        "flex_grn_summary","flex_grn_mapping",
+                        "flex_grn_file_name","flex_grn_current_snapshot"
+                    ]:
+                        st.session_state.pop(k, None)
 
-            except Exception as e:
-                st.error(f"Could not process team GRN Excel: {e}")
+                    invalidate_dashboard_cache()
+                    st.rerun()
+
+        except Exception as e:
+            st.error(f"Could not process team GRN Excel: {e}")
 
 # ---------------------------------------------------------
 # UPLOAD CENTRE
