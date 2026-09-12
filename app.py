@@ -10186,32 +10186,100 @@ def customer_no_by_ledger_pin():
     """
     Historical Customer No mapping from Sale Register destination.
 
-    Key = canonical ledger + 6-digit destination PIN.
-    A mapping is used only when that key has exactly one Customer No.
-    This is safer for multi-location customers such as Scootsy, where the
-    same customer item codes can exist across many branches/customer codes.
+    This function is schema-safe. Older Sale Register tables may not contain
+    a 'customer_no' column, so available columns are discovered first.
+
+    Priority customer-number source columns when present:
+      customer_no
+      customer_number
+      customer_code
+      sell_to_customer_no
+      sell_to_customer_number
+
+    Location PIN is taken from post_code / ship-to address columns when present.
+    Mapping is returned only when Ledger + PIN resolves to one unique customer no.
     """
-    d = read_sql(
-        """SELECT ledger_name,customer_no,post_code,
-                  ship_to_address1,ship_to_address2
-           FROM sale_register
-           WHERE TRIM(COALESCE(customer_no,''))<>''
-             AND TRIM(COALESCE(ledger_name,''))<>''"""
+    con = open_db()
+    try:
+        if USE_POSTGRES:
+            schema_rows = con.execute(
+                """SELECT column_name
+                   FROM information_schema.columns
+                   WHERE table_schema='public'
+                     AND table_name='sale_register'
+                   ORDER BY ordinal_position"""
+            ).fetchall()
+            available = [str(r[0]) for r in schema_rows]
+        else:
+            available = [str(r[1]) for r in con.execute(
+                "PRAGMA table_info(sale_register)"
+            ).fetchall()]
+    finally:
+        con.close()
+
+    available_l = {c.lower(): c for c in available}
+
+    def pick(*names):
+        for n in names:
+            if n.lower() in available_l:
+                return available_l[n.lower()]
+        return None
+
+    c_ledger = pick("ledger_name", "ledger", "customer_name")
+    c_customer = pick(
+        "customer_no",
+        "customer_number",
+        "customer_code",
+        "sell_to_customer_no",
+        "sell_to_customer_number",
     )
+    c_post = pick("post_code", "postcode", "pin_code", "pincode")
+    c_addr1 = pick(
+        "ship_to_address1", "ship_to_address_1",
+        "ship_to_address", "shipping_address"
+    )
+    c_addr2 = pick(
+        "ship_to_address2", "ship_to_address_2",
+        "shipping_address2"
+    )
+
+    # Older schemas without a customer-number field cannot provide this
+    # historical mapping. Return an empty map and allow the existing B2B
+    # fallback logic to continue normally.
+    if not c_ledger or not c_customer:
+        return {}
+
+    select_cols = [c_ledger, c_customer]
+    for c in [c_post, c_addr1, c_addr2]:
+        if c and c not in select_cols:
+            select_cols.append(c)
+
+    sql = (
+        "SELECT " + ",".join(select_cols) +
+        " FROM sale_register"
+    )
+    d = read_sql(sql)
     if d.empty:
         return {}
 
     found = {}
+
     for _, r in d.iterrows():
-        ledger_k = canonical_ledger_name(r.get("ledger_name"))
-        pin = extract_pin_from_text(
-            r.get("post_code"),
-            r.get("ship_to_address1"),
-            r.get("ship_to_address2"),
-        )
-        customer_no = text_value(r.get("customer_no")).strip()
-        if not ledger_k or not pin or not customer_no:
+        ledger_k = canonical_ledger_name(r.get(c_ledger))
+        customer_no = text_value(r.get(c_customer)).strip()
+
+        if not ledger_k or not customer_no:
             continue
+
+        pin_parts = []
+        for c in [c_post, c_addr1, c_addr2]:
+            if c:
+                pin_parts.append(r.get(c))
+
+        pin = extract_pin_from_text(*pin_parts)
+        if not pin:
+            continue
+
         found.setdefault((ledger_k, pin), set()).add(customer_no)
 
     return {
@@ -10622,9 +10690,9 @@ full_name = text_value(st.session_state.get("auth_full_name"))
 
 with st.sidebar:
     st.caption(
-        "Database: Supabase PostgreSQL • V63.57 SCOOTSY PO FIX"
+        "Database: Supabase PostgreSQL • V63.58 SCOOTSY CUSTOMER MAP SCHEMA FIX"
         if USE_POSTGRES else
-        "Database: Local SQLite • V63.57 SCOOTSY PO FIX"
+        "Database: Local SQLite • V63.58 SCOOTSY CUSTOMER MAP SCHEMA FIX"
     )
     st.markdown("## Control Tower")
 
