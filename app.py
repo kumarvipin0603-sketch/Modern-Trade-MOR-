@@ -7739,6 +7739,343 @@ def save_grn_working_changes(working_df, changed_by, reason="Main reconciliation
     finally:
         con.close()
 
+
+def save_grn_working_changes_fast(working_df, changed_by, reason="GRN bulk Excel update"):
+    """
+    Fast bulk GRN save for PostgreSQL/Supabase.
+
+    V63.61:
+    - stages all uploaded changes in one temporary table
+    - updates authoritative reconciliation overrides in bulk
+    - updates/inserts grn_lines in bulk
+    - writes audit differences in SQL
+    - commits once
+
+    This avoids thousands of network round-trips when 500+ GRN rows are saved.
+    SQLite/local fallback continues to use the proven row-wise saver.
+    """
+    if working_df is None or working_df.empty:
+        return 0, 0
+
+    if not USE_POSTGRES:
+        return save_grn_working_changes(working_df, changed_by, reason)
+
+    now = datetime.now().isoformat(timespec="seconds")
+    payload = []
+
+    for _, row in working_df.iterrows():
+        po_no = _clean_excel_value(row.get("Po Number"))
+        invoice_no = _clean_excel_value(row.get("Invoice No"))
+        sku = _clean_excel_value(row.get("Product/Item No"))
+        if not po_no or not invoice_no or not sku:
+            continue
+
+        payload.append((
+            po_no,
+            invoice_no,
+            sku,
+            _clean_excel_value(row.get("Ledger Name")),
+            _clean_excel_value(row.get("Item Description")),
+            number_value(row.get("Billed Qty")),
+            _clean_excel_value(row.get("GRN No.")),
+            _clean_excel_value(row.get("GRN Date")),
+            number_value(row.get("GRN Qty")),
+            _clean_excel_value(row.get("Delivery/Cancel Date")),
+            _clean_excel_value(row.get("Delivery Remarks")),
+            number_value(row.get("Short Delivered")),
+            _clean_excel_value(row.get("MIR No.")),
+            _clean_excel_value(row.get("Sumit Invoice upload")),
+            _clean_excel_value(row.get("POD Remarks")),
+        ))
+
+    if not payload:
+        return 0, 0
+
+    con = open_db()
+    try:
+        raw = con._con
+        cur = raw.cursor()
+
+        cur.execute("""
+            CREATE TEMP TABLE tmp_grn_bulk_update(
+                po_no TEXT,
+                invoice_no TEXT,
+                erp_item_code TEXT,
+                ledger_name TEXT,
+                item_description TEXT,
+                billed_qty DOUBLE PRECISION,
+                grn_no TEXT,
+                grn_date TEXT,
+                grn_qty DOUBLE PRECISION,
+                delivery_cancel_date TEXT,
+                delivery_remarks TEXT,
+                short_delivered DOUBLE PRECISION,
+                mir_no TEXT,
+                sumit_invoice_upload TEXT,
+                pod_remarks TEXT
+            ) ON COMMIT DROP
+        """)
+
+        execute_values(
+            cur,
+            """
+            INSERT INTO tmp_grn_bulk_update(
+                po_no,invoice_no,erp_item_code,ledger_name,item_description,billed_qty,
+                grn_no,grn_date,grn_qty,delivery_cancel_date,delivery_remarks,
+                short_delivered,mir_no,sumit_invoice_upload,pod_remarks
+            ) VALUES %s
+            """,
+            payload,
+            page_size=1000
+        )
+
+        # Keep one staged row per reconciliation key.
+        cur.execute("""
+            CREATE TEMP TABLE tmp_grn_bulk_one AS
+            SELECT DISTINCT ON (
+                UPPER(TRIM(po_no)),
+                UPPER(TRIM(invoice_no)),
+                UPPER(TRIM(erp_item_code))
+            ) *
+            FROM tmp_grn_bulk_update
+            ORDER BY
+                UPPER(TRIM(po_no)),
+                UPPER(TRIM(invoice_no)),
+                UPPER(TRIM(erp_item_code))
+        """)
+
+        # ---------------------------------------------------------
+        # Audit existing grn_lines BEFORE update.
+        # One SQL statement records every changed field.
+        # ---------------------------------------------------------
+        cur.execute("""
+            WITH latest AS (
+                SELECT DISTINCT ON (
+                    UPPER(TRIM(COALESCE(po_no,''))),
+                    UPPER(TRIM(COALESCE(invoice_no,''))),
+                    UPPER(TRIM(COALESCE(erp_item_code,'')))
+                )
+                    *
+                FROM grn_lines
+                ORDER BY
+                    UPPER(TRIM(COALESCE(po_no,''))),
+                    UPPER(TRIM(COALESCE(invoice_no,''))),
+                    UPPER(TRIM(COALESCE(erp_item_code,''))),
+                    id DESC
+            )
+            INSERT INTO grn_manual_audit(
+                grn_row_id,po_no,invoice_no,erp_item_code,field_name,
+                previous_value,new_value,reason,changed_by,changed_at
+            )
+            SELECT
+                l.id,
+                s.po_no,
+                s.invoice_no,
+                s.erp_item_code,
+                v.field_name,
+                v.old_value,
+                v.new_value,
+                %s,
+                %s,
+                %s
+            FROM tmp_grn_bulk_one s
+            JOIN latest l
+              ON UPPER(TRIM(COALESCE(l.po_no,''))) = UPPER(TRIM(s.po_no))
+             AND UPPER(TRIM(COALESCE(l.invoice_no,''))) = UPPER(TRIM(s.invoice_no))
+             AND UPPER(TRIM(COALESCE(l.erp_item_code,''))) = UPPER(TRIM(s.erp_item_code))
+            CROSS JOIN LATERAL (
+                VALUES
+                    ('grn_no', COALESCE(l.grn_no,''), COALESCE(s.grn_no,'')),
+                    ('grn_date', COALESCE(l.grn_date,''), COALESCE(s.grn_date,'')),
+                    ('grn_qty', COALESCE(l.grn_qty,0)::text, COALESCE(s.grn_qty,0)::text),
+                    ('delivery_cancel_date', COALESCE(l.delivery_cancel_date,''), COALESCE(s.delivery_cancel_date,'')),
+                    ('delivery_remarks', COALESCE(l.delivery_remarks,''), COALESCE(s.delivery_remarks,'')),
+                    ('short_delivered', COALESCE(l.short_delivered,0)::text, COALESCE(s.short_delivered,0)::text),
+                    ('mir_no', COALESCE(l.mir_no,''), COALESCE(s.mir_no,'')),
+                    ('sumit_invoice_upload', COALESCE(l.sumit_invoice_upload,''), COALESCE(s.sumit_invoice_upload,'')),
+                    ('pod_remarks', COALESCE(l.pod_remarks,''), COALESCE(s.pod_remarks,''))
+            ) AS v(field_name,old_value,new_value)
+            WHERE v.old_value IS DISTINCT FROM v.new_value
+        """, (reason, changed_by, now))
+        audited_existing = cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+
+        # ---------------------------------------------------------
+        # Update latest existing grn_lines rows in one statement.
+        # ---------------------------------------------------------
+        cur.execute("""
+            WITH latest_ids AS (
+                SELECT DISTINCT ON (
+                    UPPER(TRIM(COALESCE(po_no,''))),
+                    UPPER(TRIM(COALESCE(invoice_no,''))),
+                    UPPER(TRIM(COALESCE(erp_item_code,'')))
+                )
+                    id,po_no,invoice_no,erp_item_code
+                FROM grn_lines
+                ORDER BY
+                    UPPER(TRIM(COALESCE(po_no,''))),
+                    UPPER(TRIM(COALESCE(invoice_no,''))),
+                    UPPER(TRIM(COALESCE(erp_item_code,''))),
+                    id DESC
+            )
+            UPDATE grn_lines g
+               SET grn_no=s.grn_no,
+                   grn_date=s.grn_date,
+                   grn_qty=s.grn_qty,
+                   delivery_cancel_date=s.delivery_cancel_date,
+                   delivery_remarks=s.delivery_remarks,
+                   short_delivered=s.short_delivered,
+                   mir_no=s.mir_no,
+                   sumit_invoice_upload=s.sumit_invoice_upload,
+                   pod_remarks=s.pod_remarks,
+                   source_type='Main Dashboard GRN Update',
+                   updated_at=%s
+              FROM tmp_grn_bulk_one s
+              JOIN latest_ids l
+                ON UPPER(TRIM(COALESCE(l.po_no,''))) = UPPER(TRIM(s.po_no))
+               AND UPPER(TRIM(COALESCE(l.invoice_no,''))) = UPPER(TRIM(s.invoice_no))
+               AND UPPER(TRIM(COALESCE(l.erp_item_code,''))) = UPPER(TRIM(s.erp_item_code))
+             WHERE g.id=l.id
+        """, (now,))
+        updated_count = cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+
+        # ---------------------------------------------------------
+        # Insert missing grn_lines in bulk.
+        # ---------------------------------------------------------
+        cur.execute("""
+            INSERT INTO grn_lines(
+                source_key,po_no,ledger_name,invoice_no,invoice_date,
+                erp_item_code,item_description,invoice_qty,transporter,docket_no,
+                grn_no,grn_date,grn_qty,delivery_cancel_date,delivery_remarks,
+                short_delivered,mir_no,sumit_invoice_upload,pod_remarks,status,
+                source_type,updated_at
+            )
+            SELECT
+                MD5('MAIN-GRN|' || s.po_no || '|' || s.invoice_no || '|' || s.erp_item_code),
+                s.po_no,s.ledger_name,s.invoice_no,'',
+                s.erp_item_code,s.item_description,s.billed_qty,'','',
+                s.grn_no,s.grn_date,s.grn_qty,s.delivery_cancel_date,s.delivery_remarks,
+                s.short_delivered,s.mir_no,s.sumit_invoice_upload,s.pod_remarks,
+                'Updated by Team','Main Dashboard GRN Update',%s
+            FROM tmp_grn_bulk_one s
+            WHERE NOT EXISTS (
+                SELECT 1
+                FROM grn_lines g
+                WHERE UPPER(TRIM(COALESCE(g.po_no,''))) = UPPER(TRIM(s.po_no))
+                  AND UPPER(TRIM(COALESCE(g.invoice_no,''))) = UPPER(TRIM(s.invoice_no))
+                  AND UPPER(TRIM(COALESCE(g.erp_item_code,''))) = UPPER(TRIM(s.erp_item_code))
+            )
+              AND (
+                    COALESCE(TRIM(s.grn_no),'') <> ''
+                 OR COALESCE(TRIM(s.grn_date),'') <> ''
+                 OR COALESCE(s.grn_qty,0) <> 0
+                 OR COALESCE(TRIM(s.delivery_cancel_date),'') <> ''
+                 OR COALESCE(TRIM(s.delivery_remarks),'') <> ''
+                 OR COALESCE(s.short_delivered,0) <> 0
+                 OR COALESCE(TRIM(s.mir_no),'') <> ''
+                 OR COALESCE(TRIM(s.sumit_invoice_upload),'') <> ''
+                 OR COALESCE(TRIM(s.pod_remarks),'') <> ''
+              )
+            ON CONFLICT (source_key) DO NOTHING
+        """, (now,))
+        inserted_count = cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+
+        # Audit newly created rows once.
+        cur.execute("""
+            INSERT INTO grn_manual_audit(
+                grn_row_id,po_no,invoice_no,erp_item_code,field_name,
+                previous_value,new_value,reason,changed_by,changed_at
+            )
+            SELECT
+                g.id,s.po_no,s.invoice_no,s.erp_item_code,'ROW','',
+                'GRN working row created from Main Reconciliation',
+                %s,%s,%s
+            FROM tmp_grn_bulk_one s
+            JOIN grn_lines g
+              ON UPPER(TRIM(COALESCE(g.po_no,''))) = UPPER(TRIM(s.po_no))
+             AND UPPER(TRIM(COALESCE(g.invoice_no,''))) = UPPER(TRIM(s.invoice_no))
+             AND UPPER(TRIM(COALESCE(g.erp_item_code,''))) = UPPER(TRIM(s.erp_item_code))
+            WHERE g.updated_at=%s
+              AND g.source_type='Main Dashboard GRN Update'
+              AND NOT EXISTS (
+                    SELECT 1 FROM grn_manual_audit a
+                    WHERE a.grn_row_id=g.id
+                      AND a.field_name='ROW'
+                      AND a.changed_at=%s
+              )
+        """, (reason, changed_by, now, now, now))
+        audited_new = cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+
+        # ---------------------------------------------------------
+        # Authoritative reconciliation override: bulk UPDATE then INSERT.
+        # ---------------------------------------------------------
+        cur.execute("""
+            UPDATE grn_reconciliation_override o
+               SET grn_no=s.grn_no,
+                   grn_date=s.grn_date,
+                   grn_qty=s.grn_qty,
+                   delivery_cancel_date=s.delivery_cancel_date,
+                   delivery_remarks=s.delivery_remarks,
+                   short_delivered=s.short_delivered,
+                   mir_no=s.mir_no,
+                   sumit_invoice_upload=s.sumit_invoice_upload,
+                   pod_remarks=s.pod_remarks,
+                   changed_by=%s,
+                   reason=%s,
+                   updated_at=%s
+              FROM tmp_grn_bulk_one s
+             WHERE UPPER(TRIM(COALESCE(o.po_no,''))) = UPPER(TRIM(s.po_no))
+               AND UPPER(TRIM(COALESCE(o.invoice_no,''))) = UPPER(TRIM(s.invoice_no))
+               AND UPPER(TRIM(COALESCE(o.erp_item_code,''))) = UPPER(TRIM(s.erp_item_code))
+        """, (changed_by, reason, now))
+
+        cur.execute("""
+            INSERT INTO grn_reconciliation_override(
+                po_no,invoice_no,erp_item_code,
+                grn_no,grn_date,grn_qty,
+                delivery_cancel_date,delivery_remarks,short_delivered,
+                mir_no,sumit_invoice_upload,pod_remarks,
+                changed_by,reason,updated_at
+            )
+            SELECT
+                s.po_no,s.invoice_no,s.erp_item_code,
+                s.grn_no,s.grn_date,s.grn_qty,
+                s.delivery_cancel_date,s.delivery_remarks,s.short_delivered,
+                s.mir_no,s.sumit_invoice_upload,s.pod_remarks,
+                %s,%s,%s
+            FROM tmp_grn_bulk_one s
+            WHERE NOT EXISTS (
+                SELECT 1
+                FROM grn_reconciliation_override o
+                WHERE UPPER(TRIM(COALESCE(o.po_no,''))) = UPPER(TRIM(s.po_no))
+                  AND UPPER(TRIM(COALESCE(o.invoice_no,''))) = UPPER(TRIM(s.invoice_no))
+                  AND UPPER(TRIM(COALESCE(o.erp_item_code,''))) = UPPER(TRIM(s.erp_item_code))
+            )
+            ON CONFLICT (po_no,invoice_no,erp_item_code) DO NOTHING
+        """, (changed_by, reason, now))
+
+        raw.commit()
+        cur.close()
+
+        saved = updated_count + inserted_count
+        audited = audited_existing + audited_new
+
+        try:
+            st.cache_data.clear()
+        except Exception:
+            pass
+
+        return saved, audited
+
+    except Exception:
+        try:
+            con.rollback()
+        except Exception:
+            pass
+        raise
+    finally:
+        con.close()
+
+
 def grn_working_excel_bytes(df):
     cols = [c for c in (GRN_WORKING_ID_COLUMNS + GRN_EDIT_COLUMNS) if c in df.columns]
     work = df[cols].copy()
@@ -10742,9 +11079,9 @@ full_name = text_value(st.session_state.get("auth_full_name"))
 
 with st.sidebar:
     st.caption(
-        "Database: Supabase PostgreSQL • V63.60 FAST GRN BULK UPLOAD"
+        "Database: Supabase PostgreSQL • V63.61 FAST GRN BULK SAVE"
         if USE_POSTGRES else
-        "Database: Local SQLite • V63.60 FAST GRN BULK UPLOAD"
+        "Database: Local SQLite • V63.61 FAST GRN BULK SAVE"
     )
     st.markdown("## Control Tower")
 
@@ -12768,7 +13105,7 @@ elif page == "GRN Bulk Upload":
                     )
 
                     with st.spinner("Updating matched GRN rows..."):
-                        saved, audited = save_grn_working_changes(
+                        saved, audited = save_grn_working_changes_fast(
                             prepared_updates,
                             user,
                             reason
