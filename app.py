@@ -4243,7 +4243,9 @@ def apply_ship_to_code_everywhere(data):
     if data is None or data.empty:
         return data
 
-    out = data.copy()
+    # Caller passes a working DataFrame; mutate it in-place to avoid creating
+    # another full reconciliation copy on every Streamlit rerun.
+    out = data
     if "Ship to Location Code" not in out.columns:
         return out
 
@@ -6378,10 +6380,8 @@ def sale_split(df):
     if df.empty:
         return df.copy(), df.copy()
 
-    x = df.copy()
-
-    is_sale, is_return = sale_return_masks(x)
-    return x.loc[is_sale].copy(), x.loc[is_return].copy()
+    is_sale, is_return = sale_return_masks(df)
+    return df.loc[is_sale].copy(), df.loc[is_return].copy()
 
 
 @st.cache_data(show_spinner=False, ttl=120, max_entries=8)
@@ -6971,7 +6971,6 @@ def full_main_dashboard():
             key_df[col] = s.fillna("").astype(str).str.strip().str.upper()
 
     df = df.loc[~key_df.duplicated(subset=visible_key, keep="first")].copy()
-    df = normalize_main_dataframe_types(df)
     return df.reset_index(drop=True)
 
 # =========================================================
@@ -7185,18 +7184,29 @@ def _clean_excel_value(v):
 
 def normalize_main_dataframe_types(df):
     """
-    Normalize Main Reconciliation text columns in-place for Streamlit/PyArrow.
+    Normalize only the DataFrame being sent to Streamlit/PyArrow.
 
-    Business numeric columns are deliberately left numeric. All remaining
-    Main Reconciliation fields are identifiers, dates or remarks and are
-    normalized to strings so mixed Excel values (e.g. MIR No. 123 + "ABC")
-    cannot crash dataframe/data_editor serialization.
+    Keep business numeric columns numeric. Identifier/date/remark columns are
+    converted vectorially to strings so mixed Excel values (for example MIR No.
+    containing both integers and text) cannot trigger ArrowTypeError.
     """
     if df is None or df.empty:
         return df
+
     for col in MAIN_COLUMNS:
-        if col in df.columns and col not in MAIN_NUMERIC_COLUMNS:
-            df[col] = df[col].apply(_clean_excel_value)
+        if col not in df.columns or col in MAIN_NUMERIC_COLUMNS:
+            continue
+
+        s = df[col]
+        if pd.api.types.is_datetime64_any_dtype(s):
+            df[col] = s.dt.strftime("%Y-%m-%d").fillna("")
+        else:
+            df[col] = (
+                s.where(s.notna(), "")
+                 .astype(str)
+                 .str.strip()
+                 .replace({"nan": "", "NaT": "", "None": ""})
+            )
     return df
 
 
@@ -8676,11 +8686,11 @@ def available_main_dashboard():
     Other source data is aggregated once and merged, instead of filtering
     full DataFrames once for every invoice row.
     """
-    sale = cached_table("sale_register").copy()
-    po = cached_table("po_lines").copy()
-    so = cached_table("sales_order_map").copy()
-    blocked = cached_table("blocked_shipments").copy()
-    grn = cached_table("grn_lines").copy()
+    sale = cached_table("sale_register")
+    po = cached_table("po_lines")
+    so = cached_table("sales_order_map")
+    blocked = cached_table("blocked_shipments")
+    grn = cached_table("grn_lines")
 
     if sale.empty:
         # Fall back to source PO references only if Sale Register has not loaded.
@@ -8711,9 +8721,14 @@ def available_main_dashboard():
             sale[col] = default
 
     inv, cns = sale_split(sale)
+    # Release the original full Sale Register as soon as the two working
+    # subsets exist. This materially lowers peak RAM on Streamlit Community
+    # Cloud for the ALL-financial-years reconciliation.
+    del sale
+    gc.collect()
+
     # sale_register already contains only exact unique source rows.
     # Do not collapse distinct ERP rows again at dashboard level.
-    inv = inv.copy()
 
     # V63.12 PO ERP REPAIR
     # Historical PO rows can have Customer Item populated while ERP Item is blank.
@@ -8724,7 +8739,7 @@ def available_main_dashboard():
                 po[c] = ""
 
         try:
-            sku_master_for_po = cached_table("sku_master").copy()
+            sku_master_for_po = cached_table("sku_master")
         except Exception:
             sku_master_for_po = pd.DataFrame()
 
@@ -9530,7 +9545,6 @@ def available_main_dashboard():
         if col not in out.columns:
             out[col] = ""
     out = enrich_ship_to_location_codes(out)
-    out = normalize_main_dataframe_types(out)
     return out[MAIN_COLUMNS]
 
 
@@ -10385,8 +10399,9 @@ def overlay_live_po_details(data):
 
     if data is None or data.empty:
         data = pd.DataFrame(columns=MAIN_COLUMNS)
-    else:
-        data = data.copy()
+    # available_main_dashboard() is returned from st.cache_data as a private
+    # deserialized object for this rerun, so mutating it here is safe and avoids
+    # one additional full-size DataFrame copy.
 
     for c in MAIN_COLUMNS:
         if c not in data.columns:
@@ -11157,9 +11172,9 @@ full_name = text_value(st.session_state.get("auth_full_name"))
 
 with st.sidebar:
     st.caption(
-        "Database: Supabase PostgreSQL • V63.61 FAST GRN BULK SAVE"
+        "Database: Supabase PostgreSQL • V63.62 STREAMLIT STABILITY"
         if USE_POSTGRES else
-        "Database: Local SQLite • V63.61 FAST GRN BULK SAVE"
+        "Database: Local SQLite • V63.62 STREAMLIT STABILITY"
     )
     st.markdown("## Control Tower")
 
@@ -11295,7 +11310,6 @@ if page == "Main Reconciliation Dashboard":
     data = available_main_dashboard()
     data = overlay_live_po_details(data)
     data = apply_ship_to_code_everywhere(data)
-    data = normalize_main_dataframe_types(data)
 
     # Uploaded-PO visibility.
     live_keys = uploaded_po_keys()
@@ -11638,6 +11652,9 @@ if page == "Main Reconciliation Dashboard":
         else:
             pcol3.caption("No reconciliation rows")
         page_data = data.iloc[(page_no-1)*page_size:page_no*page_size].copy()
+        # Only the visible page is serialized to Arrow. Normalize here instead
+        # of coercing hundreds of thousands of rows on every rerun.
+        page_data = normalize_main_dataframe_types(page_data)
 
         # Auto-fit table height to actual visible rows:
         # 1 reconciliation line = 1 visible row, 4 lines = 4 visible rows.
@@ -11685,19 +11702,21 @@ if page == "Main Reconciliation Dashboard":
         with action2:
             st.download_button(
                 "Download GRN Working Sheet",
-                grn_working_excel_bytes(data),
-                f"{('_'.join(selected_pos) if selected_pos else 'ALL')}_GRN_Working_Sheet.xlsx",
-                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                width="stretch"
+                data=lambda: grn_working_excel_bytes(data),
+                file_name=f"{('_'.join(selected_pos) if selected_pos else 'ALL')}_GRN_Working_Sheet.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                width="stretch",
+                on_click="ignore"
             )
 
         with action3:
             st.download_button(
                 "Download Full Reconciliation",
-                data.to_csv(index=False).encode("utf-8-sig"),
-                f"Main_Reconciliation_Dashboard_FY_{'ALL' if selected_financial_year == 'All' else selected_financial_year}.csv",
-                "text/csv",
-                width="stretch"
+                data=lambda: data.to_csv(index=False).encode("utf-8-sig"),
+                file_name=f"Main_Reconciliation_Dashboard_FY_{'ALL' if selected_financial_year == 'All' else selected_financial_year}.csv",
+                mime="text/csv",
+                width="stretch",
+                on_click="ignore"
             )
 
         st.markdown("#### Upload MOR Master File — Validation Only")
@@ -12075,10 +12094,11 @@ elif page == "B2B Order Staging":
         # Download follows the same global PO-search scope.
         st.download_button(
             "Download B2B Order Staging",
-            b2b_order_staging_excel_bytes(staging_scope),
-            f"B2B_Dealer_Order_Staging_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
-            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            width="stretch"
+            data=lambda: b2b_order_staging_excel_bytes(staging_scope),
+            file_name=f"B2B_Dealer_Order_Staging_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            width="stretch",
+            on_click="ignore"
         )
 
 # ---------------------------------------------------------
@@ -12144,9 +12164,10 @@ elif page == "Factory Stock Requirement":
         safe_fy = "ALL" if selected_financial_year == "All" else selected_financial_year
         st.download_button(
             "Download Factory Requirement",
-            view.to_csv(index=False).encode("utf-8-sig"),
-            f"Factory_Stock_Requirement_{safe_branch_name}_FY_{safe_fy}.csv",
-            "text/csv"
+            data=lambda: view.to_csv(index=False).encode("utf-8-sig"),
+            file_name=f"Factory_Stock_Requirement_{safe_branch_name}_FY_{safe_fy}.csv",
+            mime="text/csv",
+            on_click="ignore"
         )
 
 # ---------------------------------------------------------
@@ -12338,9 +12359,10 @@ elif page == "Sales & Return 360°":
         st.markdown("### Sales / Return Drilldown")
         st.download_button(
             "Download Sale Register Control Extract",
-            view.to_csv(index=False).encode("utf-8-sig"),
-            f"Sale_Register_Control_FY_{'ALL' if selected_financial_year == 'All' else selected_financial_year}.csv",
-            "text/csv"
+            data=lambda: view.to_csv(index=False).encode("utf-8-sig"),
+            file_name=f"Sale_Register_Control_FY_{'ALL' if selected_financial_year == 'All' else selected_financial_year}.csv",
+            mime="text/csv",
+            on_click="ignore"
         )
 
         display_limit = st.selectbox("Rows to display", [500,1000,2500,5000], index=1)
@@ -12348,9 +12370,10 @@ elif page == "Sales & Return 360°":
         st.dataframe(view.head(display_limit), width="stretch", hide_index=True, height=480)
         st.download_button(
             "Download Sales & Return Detail",
-            view.to_csv(index=False).encode("utf-8-sig"),
-            "Sales_Return_360.csv",
-            "text/csv"
+            data=lambda: view.to_csv(index=False).encode("utf-8-sig"),
+            file_name="Sales_Return_360.csv",
+            mime="text/csv",
+            on_click="ignore"
         )
 
 # ---------------------------------------------------------
