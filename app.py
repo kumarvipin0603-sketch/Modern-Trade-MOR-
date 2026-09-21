@@ -6326,6 +6326,54 @@ def sale_return_masks(df):
     return is_sale, is_return
 
 
+@st.cache_data(show_spinner=False, ttl=120, max_entries=1)
+def sale_return_row_counts_db():
+    """
+    Return Sale Register row counts without loading the full table into pandas.
+
+    Classification exactly mirrors sale_return_masks():
+      - Invoice -> sale
+      - Credit Memo -> return
+      - blank Document Type -> SR/CN/negative qty is return; otherwise sale
+    """
+    q = """
+        SELECT
+          COUNT(*) AS source_rows,
+          COALESCE(SUM(CASE
+            WHEN UPPER(TRIM(COALESCE(document_type,'')))='INVOICE'
+              OR (
+                TRIM(COALESCE(document_type,''))=''
+                AND NOT (
+                  UPPER(TRIM(COALESCE(invoice_no,''))) LIKE 'SR%'
+                  OR UPPER(TRIM(COALESCE(invoice_no,''))) LIKE 'CN%'
+                  OR COALESCE(qty,0) < 0
+                )
+              )
+            THEN 1 ELSE 0 END),0) AS sale_rows,
+          COALESCE(SUM(CASE
+            WHEN UPPER(TRIM(COALESCE(document_type,'')))='CREDIT MEMO'
+              OR (
+                TRIM(COALESCE(document_type,''))=''
+                AND (
+                  UPPER(TRIM(COALESCE(invoice_no,''))) LIKE 'SR%'
+                  OR UPPER(TRIM(COALESCE(invoice_no,''))) LIKE 'CN%'
+                  OR COALESCE(qty,0) < 0
+                )
+              )
+            THEN 1 ELSE 0 END),0) AS return_rows
+        FROM sale_register
+    """
+    d = read_sql(q)
+    if d.empty:
+        return {"source_rows": 0, "sale_rows": 0, "return_rows": 0}
+    r = d.iloc[0]
+    return {
+        "source_rows": int(r["source_rows"] or 0),
+        "sale_rows": int(r["sale_rows"] or 0),
+        "return_rows": int(r["return_rows"] or 0),
+    }
+
+
 def sale_split(df):
     if df.empty:
         return df.copy(), df.copy()
@@ -6570,6 +6618,16 @@ MAIN_COLUMNS = [
     "CN /SR Date","CN /SR Qty","CN /SR Value","CN TAT","Return Docket Number",
     "Fill rate","POD Remarks","Reconciliation Remarks","Assigned Remarks"
 ]
+
+# Keep identifiers / remarks as strings before Streamlit sends DataFrames to
+# PyArrow. Excel/legacy data can otherwise mix ints and strings in columns such
+# as MIR No., which causes repeated ArrowTypeError serialization failures.
+MAIN_NUMERIC_COLUMNS = {
+    "Po Qty","Po Value","Pending Billing Qty","Blocked qty in PO","Branch Stock",
+    "Rest Blocked Qty","Billed Qty","Unit Price","Line Amount","CGST Amount",
+    "SGST Amount","IGST Amount","Total GST Amount","Gross Amount","GRN Qty",
+    "Short Delivered","CN /SR Qty","CN /SR Value","Fill rate"
+}
 
 def blank_main_row():
     return {c: "" for c in MAIN_COLUMNS}
@@ -6913,6 +6971,7 @@ def full_main_dashboard():
             key_df[col] = s.fillna("").astype(str).str.strip().str.upper()
 
     df = df.loc[~key_df.duplicated(subset=visible_key, keep="first")].copy()
+    df = normalize_main_dataframe_types(df)
     return df.reset_index(drop=True)
 
 # =========================================================
@@ -7122,6 +7181,24 @@ def _clean_excel_value(v):
     if isinstance(v, pd.Timestamp):
         return v.strftime("%Y-%m-%d")
     return str(v).strip()
+
+
+def normalize_main_dataframe_types(df):
+    """
+    Normalize Main Reconciliation text columns in-place for Streamlit/PyArrow.
+
+    Business numeric columns are deliberately left numeric. All remaining
+    Main Reconciliation fields are identifiers, dates or remarks and are
+    normalized to strings so mixed Excel values (e.g. MIR No. 123 + "ABC")
+    cannot crash dataframe/data_editor serialization.
+    """
+    if df is None or df.empty:
+        return df
+    for col in MAIN_COLUMNS:
+        if col in df.columns and col not in MAIN_NUMERIC_COLUMNS:
+            df[col] = df[col].apply(_clean_excel_value)
+    return df
+
 
 def _grn_existing_row(con, po_no, invoice_no, sku):
     return con.execute(
@@ -9453,6 +9530,7 @@ def available_main_dashboard():
         if col not in out.columns:
             out[col] = ""
     out = enrich_ship_to_location_codes(out)
+    out = normalize_main_dataframe_types(out)
     return out[MAIN_COLUMNS]
 
 
@@ -11217,6 +11295,7 @@ if page == "Main Reconciliation Dashboard":
     data = available_main_dashboard()
     data = overlay_live_po_details(data)
     data = apply_ship_to_code_everywhere(data)
+    data = normalize_main_dataframe_types(data)
 
     # Uploaded-PO visibility.
     live_keys = uploaded_po_keys()
@@ -11368,11 +11447,10 @@ if page == "Main Reconciliation Dashboard":
     # invoice rows because Credit Memo / Sale Return rows are merged into their
     # related invoice rows rather than shown as separate rows.
     try:
-        _sr_audit = cached_table("sale_register").copy()
-        _audit_sale, _audit_return = sale_return_masks(_sr_audit)
-        _source_total = len(_sr_audit)
-        _source_invoices = int(_audit_sale.sum())
-        _source_returns = int(_audit_return.sum())
+        _sr_counts = sale_return_row_counts_db()
+        _source_total = int(_sr_counts.get("source_rows", 0))
+        _source_invoices = int(_sr_counts.get("sale_rows", 0))
+        _source_returns = int(_sr_counts.get("return_rows", 0))
         st.caption(
             f"Sale Register control: {_source_total:,} source row(s) = "
             f"{_source_invoices:,} Sale Invoice row(s) + "
