@@ -4243,9 +4243,7 @@ def apply_ship_to_code_everywhere(data):
     if data is None or data.empty:
         return data
 
-    # Caller passes a working DataFrame; mutate it in-place to avoid creating
-    # another full reconciliation copy on every Streamlit rerun.
-    out = data
+    out = data.copy()
     if "Ship to Location Code" not in out.columns:
         return out
 
@@ -6328,60 +6326,14 @@ def sale_return_masks(df):
     return is_sale, is_return
 
 
-@st.cache_data(show_spinner=False, ttl=120, max_entries=1)
-def sale_return_row_counts_db():
-    """
-    Return Sale Register row counts without loading the full table into pandas.
-
-    Classification exactly mirrors sale_return_masks():
-      - Invoice -> sale
-      - Credit Memo -> return
-      - blank Document Type -> SR/CN/negative qty is return; otherwise sale
-    """
-    q = """
-        SELECT
-          COUNT(*) AS source_rows,
-          COALESCE(SUM(CASE
-            WHEN UPPER(TRIM(COALESCE(document_type,'')))='INVOICE'
-              OR (
-                TRIM(COALESCE(document_type,''))=''
-                AND NOT (
-                  UPPER(TRIM(COALESCE(invoice_no,''))) LIKE 'SR%'
-                  OR UPPER(TRIM(COALESCE(invoice_no,''))) LIKE 'CN%'
-                  OR COALESCE(qty,0) < 0
-                )
-              )
-            THEN 1 ELSE 0 END),0) AS sale_rows,
-          COALESCE(SUM(CASE
-            WHEN UPPER(TRIM(COALESCE(document_type,'')))='CREDIT MEMO'
-              OR (
-                TRIM(COALESCE(document_type,''))=''
-                AND (
-                  UPPER(TRIM(COALESCE(invoice_no,''))) LIKE 'SR%'
-                  OR UPPER(TRIM(COALESCE(invoice_no,''))) LIKE 'CN%'
-                  OR COALESCE(qty,0) < 0
-                )
-              )
-            THEN 1 ELSE 0 END),0) AS return_rows
-        FROM sale_register
-    """
-    d = read_sql(q)
-    if d.empty:
-        return {"source_rows": 0, "sale_rows": 0, "return_rows": 0}
-    r = d.iloc[0]
-    return {
-        "source_rows": int(r["source_rows"] or 0),
-        "sale_rows": int(r["sale_rows"] or 0),
-        "return_rows": int(r["return_rows"] or 0),
-    }
-
-
 def sale_split(df):
     if df.empty:
         return df.copy(), df.copy()
 
-    is_sale, is_return = sale_return_masks(df)
-    return df.loc[is_sale].copy(), df.loc[is_return].copy()
+    x = df.copy()
+
+    is_sale, is_return = sale_return_masks(x)
+    return x.loc[is_sale].copy(), x.loc[is_return].copy()
 
 
 @st.cache_data(show_spinner=False, ttl=120, max_entries=8)
@@ -6618,16 +6570,6 @@ MAIN_COLUMNS = [
     "CN /SR Date","CN /SR Qty","CN /SR Value","CN TAT","Return Docket Number",
     "Fill rate","POD Remarks","Reconciliation Remarks","Assigned Remarks"
 ]
-
-# Keep identifiers / remarks as strings before Streamlit sends DataFrames to
-# PyArrow. Excel/legacy data can otherwise mix ints and strings in columns such
-# as MIR No., which causes repeated ArrowTypeError serialization failures.
-MAIN_NUMERIC_COLUMNS = {
-    "Po Qty","Po Value","Pending Billing Qty","Blocked qty in PO","Branch Stock",
-    "Rest Blocked Qty","Billed Qty","Unit Price","Line Amount","CGST Amount",
-    "SGST Amount","IGST Amount","Total GST Amount","Gross Amount","GRN Qty",
-    "Short Delivered","CN /SR Qty","CN /SR Value","Fill rate"
-}
 
 def blank_main_row():
     return {c: "" for c in MAIN_COLUMNS}
@@ -7182,33 +7124,51 @@ def _clean_excel_value(v):
     return str(v).strip()
 
 
-def normalize_main_dataframe_types(df):
+def _clean_grn_key_value(v):
+    """Normalize PO / Invoice / ERP identifiers without changing business text.
+
+    Excel frequently stores identifier cells as numbers, so e.g. 12345 can be
+    read back as 12345.0.  Main Reconciliation stores the same identifier as
+    text (12345).  Remove only a purely numeric trailing .0 representation.
     """
-    Normalize only the DataFrame being sent to Streamlit/PyArrow.
+    s = _clean_excel_value(v)
+    if re.fullmatch(r"[+-]?\d+\.0+", s):
+        return s.split(".", 1)[0]
+    return s
 
-    Keep business numeric columns numeric. Identifier/date/remark columns are
-    converted vectorially to strings so mixed Excel values (for example MIR No.
-    containing both integers and text) cannot trigger ArrowTypeError.
+
+def _grn_key_series(df):
+    """Build the exact GRN reconciliation key with consistent string types."""
+    def col(name):
+        if name not in df.columns:
+            return pd.Series("", index=df.index, dtype="string")
+        return (
+            df[name]
+            .map(_clean_grn_key_value)
+            .astype("string")
+            .fillna("")
+            .str.strip()
+            .str.upper()
+        )
+
+    return col("Po Number") + "||" + col("Invoice No") + "||" + col("Product/Item No")
+
+
+def _arrow_safe_display_df(df):
+    """Return a display-only dataframe that PyArrow can serialize reliably.
+
+    Streamlit/PyArrow rejects object columns containing a mixture such as
+    strings + ints (MIR No.) or floats + empty strings (GRN Qty).  Business
+    data is left untouched; only the copy passed to st.dataframe is normalized.
     """
-    if df is None or df.empty:
-        return df
-
-    for col in MAIN_COLUMNS:
-        if col not in df.columns or col in MAIN_NUMERIC_COLUMNS:
-            continue
-
-        s = df[col]
-        if pd.api.types.is_datetime64_any_dtype(s):
-            df[col] = s.dt.strftime("%Y-%m-%d").fillna("")
-        else:
-            df[col] = (
-                s.where(s.notna(), "")
-                 .astype(str)
-                 .str.strip()
-                 .replace({"nan": "", "NaT": "", "None": ""})
-            )
-    return df
-
+    if df is None:
+        return pd.DataFrame()
+    safe = df.copy()
+    for c in safe.columns:
+        s = safe[c]
+        if pd.api.types.is_object_dtype(s.dtype):
+            safe[c] = s.map(lambda v: "" if pd.isna(v) else str(v)).astype("string")
+    return safe
 
 def _grn_existing_row(con, po_no, invoice_no, sku):
     return con.execute(
@@ -7273,6 +7233,7 @@ def _upsert_grn_reconciliation_override(con, po_no, invoice_no, sku, values, cha
         )
 
 
+# V63.22 GRN STABILITY PATCH: Arrow-safe types + reduced validation memory
 GRN_TEAM_UPLOAD_FIELDS = [
     "GRN No.",
     "GRN Date",
@@ -7391,18 +7352,27 @@ def normalize_team_grn_excel(df, column_map=None):
     out["_Excel Row"] = range(2, len(out) + 2)
 
     for c in ["Po Number","Invoice No","Product/Item No"]:
-        out[c] = out[c].apply(_clean_excel_value)
+        out[c] = out[c].map(_clean_grn_key_value).astype("string").fillna("")
 
     for c in [
         "GRN No.","GRN Date","Delivery/Cancel Date","Delivery Remarks",
         "MIR No.","Sumit Invoice upload","POD Remarks"
     ]:
-        out[c] = out[c].apply(_clean_excel_value)
+        out[c] = out[c].map(_clean_excel_value).astype("string").fillna("")
 
-    out["GRN Qty"] = pd.to_numeric(out["GRN Qty"], errors="coerce")
-    out["Short Delivered"] = pd.to_numeric(
-        out["Short Delivered"], errors="coerce"
-    )
+    # Nullable Float64 keeps blanks as <NA> instead of mixing '' with floats.
+    # Convert through pandas StringDtype first. This avoids pandas' deprecated
+    # object-dtype downcasting behaviour in Series.replace() and therefore also
+    # removes the FutureWarning seen on Python 3.14 / recent pandas versions.
+    def _nullable_grn_number(series):
+        s = series.astype("string").str.strip()
+        s = s.mask(s.eq(""), pd.NA)
+        # Team sheets may contain formatted numbers such as "1,250".
+        s = s.str.replace(",", "", regex=False)
+        return pd.to_numeric(s, errors="coerce").astype("Float64")
+
+    out["GRN Qty"] = _nullable_grn_number(out["GRN Qty"])
+    out["Short Delivered"] = _nullable_grn_number(out["Short Delivered"])
 
     return out, mapped
 
@@ -7439,23 +7409,37 @@ def validate_team_grn_upload(upload_df, current_df=None, column_map=None):
     if current_df is None:
         current_df = pd.DataFrame()
 
-    current = current_df.copy()
+    # Only copy columns needed by GRN validation.  The full reconciliation
+    # dataframe is wide; copying all columns here can double memory usage on
+    # Streamlit Cloud during a GRN validation run.
+    needed_current = (
+        ["Po Number","Invoice No","Product/Item No",
+         "Ledger Name","Item Description","Billed Qty"]
+        + GRN_TEAM_UPLOAD_FIELDS
+    )
+    existing_current = [c for c in needed_current if c in current_df.columns]
+    current = current_df[existing_current].copy()
 
     for c in ["Po Number","Invoice No","Product/Item No"] + GRN_TEAM_UPLOAD_FIELDS:
         if c not in current.columns:
-            current[c] = 0 if c in ("GRN Qty","Short Delivered") else ""
+            current[c] = 0.0 if c in ("GRN Qty","Short Delivered") else ""
 
-    def key_series(d):
-        return (
-            d["Po Number"].fillna("").astype(str).str.strip().str.upper()
-            + "||"
-            + d["Invoice No"].fillna("").astype(str).str.strip().str.upper()
-            + "||"
-            + d["Product/Item No"].fillna("").astype(str).str.strip().str.upper()
-        )
+    # Normalize current-side text fields too.  This prevents PyArrow/matching
+    # problems when historical MIR/GRN identifiers were stored as integers.
+    for c in [
+        "Po Number","Invoice No","Product/Item No",
+        "GRN No.","GRN Date","Delivery/Cancel Date","Delivery Remarks",
+        "MIR No.","Sumit Invoice upload","POD Remarks"
+    ]:
+        if c in current.columns:
+            cleaner = _clean_grn_key_value if c in ("Po Number","Invoice No","Product/Item No") else _clean_excel_value
+            current[c] = current[c].map(cleaner).astype("string").fillna("")
 
-    normalized["_K"] = key_series(normalized)
-    current["_K"] = key_series(current)
+    for c in ["GRN Qty","Short Delivered"]:
+        current[c] = pd.to_numeric(current[c], errors="coerce").astype("Float64")
+
+    normalized["_K"] = _grn_key_series(normalized)
+    current["_K"] = _grn_key_series(current)
 
     source_dups = normalized["_K"].value_counts().to_dict()
     current_groups = {
@@ -7563,16 +7547,38 @@ def validate_team_grn_upload(upload_df, current_df=None, column_map=None):
         }
 
         for f in GRN_TEAM_UPLOAD_FIELDS:
-            report_row[f"Excel {f}"] = (
-                "" if _grn_blank(f, r.get(f)) else r.get(f)
-            )
-            report_row[f"Current {f}"] = (
-                cur.get(f) if cur is not None else ""
-            )
+            excel_v = r.get(f)
+            current_v = cur.get(f) if cur is not None else None
+
+            if f in ("GRN Qty", "Short Delivered"):
+                # Keep the whole report column numeric; never mix float with ''.
+                report_row[f"Excel {f}"] = (
+                    pd.NA if _grn_blank(f, excel_v) else float(number_value(excel_v))
+                )
+                report_row[f"Current {f}"] = (
+                    pd.NA if _grn_blank(f, current_v) else float(number_value(current_v))
+                )
+            else:
+                # Keep identifier/text columns (especially MIR No.) as strings.
+                report_row[f"Excel {f}"] = (
+                    "" if _grn_blank(f, excel_v) else _clean_excel_value(excel_v)
+                )
+                report_row[f"Current {f}"] = (
+                    "" if _grn_blank(f, current_v) else _clean_excel_value(current_v)
+                )
 
         report_rows.append(report_row)
 
     report = pd.DataFrame(report_rows)
+
+    # Explicit dtypes remove Streamlit/PyArrow ambiguity.
+    if not report.empty:
+        for c in report.columns:
+            if c.startswith("Excel GRN Qty") or c.startswith("Current GRN Qty") \
+               or c.startswith("Excel Short Delivered") or c.startswith("Current Short Delivered"):
+                report[c] = pd.to_numeric(report[c], errors="coerce").astype("Float64")
+            elif c not in ("Excel Row", "Main Match Count"):
+                report[c] = report[c].map(lambda v: "" if pd.isna(v) else str(v)).astype("string")
 
     summary = {
         "total": len(report),
@@ -8686,11 +8692,11 @@ def available_main_dashboard():
     Other source data is aggregated once and merged, instead of filtering
     full DataFrames once for every invoice row.
     """
-    sale = cached_table("sale_register")
-    po = cached_table("po_lines")
-    so = cached_table("sales_order_map")
-    blocked = cached_table("blocked_shipments")
-    grn = cached_table("grn_lines")
+    sale = cached_table("sale_register").copy()
+    po = cached_table("po_lines").copy()
+    so = cached_table("sales_order_map").copy()
+    blocked = cached_table("blocked_shipments").copy()
+    grn = cached_table("grn_lines").copy()
 
     if sale.empty:
         # Fall back to source PO references only if Sale Register has not loaded.
@@ -8721,14 +8727,9 @@ def available_main_dashboard():
             sale[col] = default
 
     inv, cns = sale_split(sale)
-    # Release the original full Sale Register as soon as the two working
-    # subsets exist. This materially lowers peak RAM on Streamlit Community
-    # Cloud for the ALL-financial-years reconciliation.
-    del sale
-    gc.collect()
-
     # sale_register already contains only exact unique source rows.
     # Do not collapse distinct ERP rows again at dashboard level.
+    inv = inv.copy()
 
     # V63.12 PO ERP REPAIR
     # Historical PO rows can have Customer Item populated while ERP Item is blank.
@@ -8739,7 +8740,7 @@ def available_main_dashboard():
                 po[c] = ""
 
         try:
-            sku_master_for_po = cached_table("sku_master")
+            sku_master_for_po = cached_table("sku_master").copy()
         except Exception:
             sku_master_for_po = pd.DataFrame()
 
@@ -10399,9 +10400,8 @@ def overlay_live_po_details(data):
 
     if data is None or data.empty:
         data = pd.DataFrame(columns=MAIN_COLUMNS)
-    # available_main_dashboard() is returned from st.cache_data as a private
-    # deserialized object for this rerun, so mutating it here is safe and avoids
-    # one additional full-size DataFrame copy.
+    else:
+        data = data.copy()
 
     for c in MAIN_COLUMNS:
         if c not in data.columns:
@@ -11172,9 +11172,9 @@ full_name = text_value(st.session_state.get("auth_full_name"))
 
 with st.sidebar:
     st.caption(
-        "Database: Supabase PostgreSQL • V63.62 STREAMLIT STABILITY"
+        "Database: Supabase PostgreSQL • V63.61 FAST GRN BULK SAVE"
         if USE_POSTGRES else
-        "Database: Local SQLite • V63.62 STREAMLIT STABILITY"
+        "Database: Local SQLite • V63.61 FAST GRN BULK SAVE"
     )
     st.markdown("## Control Tower")
 
@@ -11461,10 +11461,11 @@ if page == "Main Reconciliation Dashboard":
     # invoice rows because Credit Memo / Sale Return rows are merged into their
     # related invoice rows rather than shown as separate rows.
     try:
-        _sr_counts = sale_return_row_counts_db()
-        _source_total = int(_sr_counts.get("source_rows", 0))
-        _source_invoices = int(_sr_counts.get("sale_rows", 0))
-        _source_returns = int(_sr_counts.get("return_rows", 0))
+        _sr_audit = cached_table("sale_register").copy()
+        _audit_sale, _audit_return = sale_return_masks(_sr_audit)
+        _source_total = len(_sr_audit)
+        _source_invoices = int(_audit_sale.sum())
+        _source_returns = int(_audit_return.sum())
         st.caption(
             f"Sale Register control: {_source_total:,} source row(s) = "
             f"{_source_invoices:,} Sale Invoice row(s) + "
@@ -11652,9 +11653,6 @@ if page == "Main Reconciliation Dashboard":
         else:
             pcol3.caption("No reconciliation rows")
         page_data = data.iloc[(page_no-1)*page_size:page_no*page_size].copy()
-        # Only the visible page is serialized to Arrow. Normalize here instead
-        # of coercing hundreds of thousands of rows on every rerun.
-        page_data = normalize_main_dataframe_types(page_data)
 
         # Auto-fit table height to actual visible rows:
         # 1 reconciliation line = 1 visible row, 4 lines = 4 visible rows.
@@ -11702,21 +11700,19 @@ if page == "Main Reconciliation Dashboard":
         with action2:
             st.download_button(
                 "Download GRN Working Sheet",
-                data=lambda: grn_working_excel_bytes(data),
-                file_name=f"{('_'.join(selected_pos) if selected_pos else 'ALL')}_GRN_Working_Sheet.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                width="stretch",
-                on_click="ignore"
+                grn_working_excel_bytes(data),
+                f"{('_'.join(selected_pos) if selected_pos else 'ALL')}_GRN_Working_Sheet.xlsx",
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                width="stretch"
             )
 
         with action3:
             st.download_button(
                 "Download Full Reconciliation",
-                data=lambda: data.to_csv(index=False).encode("utf-8-sig"),
-                file_name=f"Main_Reconciliation_Dashboard_FY_{'ALL' if selected_financial_year == 'All' else selected_financial_year}.csv",
-                mime="text/csv",
-                width="stretch",
-                on_click="ignore"
+                data.to_csv(index=False).encode("utf-8-sig"),
+                f"Main_Reconciliation_Dashboard_FY_{'ALL' if selected_financial_year == 'All' else selected_financial_year}.csv",
+                "text/csv",
+                width="stretch"
             )
 
         st.markdown("#### Upload MOR Master File — Validation Only")
@@ -12094,11 +12090,10 @@ elif page == "B2B Order Staging":
         # Download follows the same global PO-search scope.
         st.download_button(
             "Download B2B Order Staging",
-            data=lambda: b2b_order_staging_excel_bytes(staging_scope),
-            file_name=f"B2B_Dealer_Order_Staging_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            width="stretch",
-            on_click="ignore"
+            b2b_order_staging_excel_bytes(staging_scope),
+            f"B2B_Dealer_Order_Staging_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            width="stretch"
         )
 
 # ---------------------------------------------------------
@@ -12164,10 +12159,9 @@ elif page == "Factory Stock Requirement":
         safe_fy = "ALL" if selected_financial_year == "All" else selected_financial_year
         st.download_button(
             "Download Factory Requirement",
-            data=lambda: view.to_csv(index=False).encode("utf-8-sig"),
-            file_name=f"Factory_Stock_Requirement_{safe_branch_name}_FY_{safe_fy}.csv",
-            mime="text/csv",
-            on_click="ignore"
+            view.to_csv(index=False).encode("utf-8-sig"),
+            f"Factory_Stock_Requirement_{safe_branch_name}_FY_{safe_fy}.csv",
+            "text/csv"
         )
 
 # ---------------------------------------------------------
@@ -12359,10 +12353,9 @@ elif page == "Sales & Return 360°":
         st.markdown("### Sales / Return Drilldown")
         st.download_button(
             "Download Sale Register Control Extract",
-            data=lambda: view.to_csv(index=False).encode("utf-8-sig"),
-            file_name=f"Sale_Register_Control_FY_{'ALL' if selected_financial_year == 'All' else selected_financial_year}.csv",
-            mime="text/csv",
-            on_click="ignore"
+            view.to_csv(index=False).encode("utf-8-sig"),
+            f"Sale_Register_Control_FY_{'ALL' if selected_financial_year == 'All' else selected_financial_year}.csv",
+            "text/csv"
         )
 
         display_limit = st.selectbox("Rows to display", [500,1000,2500,5000], index=1)
@@ -12370,10 +12363,9 @@ elif page == "Sales & Return 360°":
         st.dataframe(view.head(display_limit), width="stretch", hide_index=True, height=480)
         st.download_button(
             "Download Sales & Return Detail",
-            data=lambda: view.to_csv(index=False).encode("utf-8-sig"),
-            file_name="Sales_Return_360.csv",
-            mime="text/csv",
-            on_click="ignore"
+            view.to_csv(index=False).encode("utf-8-sig"),
+            "Sales_Return_360.csv",
+            "text/csv"
         )
 
 # ---------------------------------------------------------
@@ -12894,7 +12886,7 @@ elif page == "GRN Bulk Upload":
 
             with st.expander("Preview uploaded Excel", expanded=False):
                 st.dataframe(
-                    source_df.head(20),
+                    _arrow_safe_display_df(source_df.head(20)),
                     width="stretch",
                     hide_index=True
                 )
@@ -12970,41 +12962,74 @@ elif page == "GRN Bulk Upload":
                     type="primary",
                     key="validate_flexible_grn"
                 ):
-                    with st.spinner(
-                        "Loading reconciliation data and validating uploaded GRN rows..."
-                    ):
-                        # IMPORTANT PERFORMANCE FIX:
-                        # available_main_dashboard() is vectorized; the older
-                        # full_main_dashboard() loops PO-by-PO across all history.
-                        current_grn = available_main_dashboard()
+                    current_grn = None
+                    try:
+                        with st.spinner(
+                            "Loading reconciliation data and validating uploaded GRN rows..."
+                        ):
+                            # available_main_dashboard() is vectorized; the older
+                            # full_main_dashboard() loops PO-by-PO across all history.
+                            current_grn = available_main_dashboard()
 
-                        normalized_df, validation_df, validation_summary, current_groups, used_map = (
-                            validate_team_grn_upload(
-                                source_df,
-                                current_grn,
-                                column_map=mapping
+                            normalized_df, validation_df, validation_summary, current_groups, used_map = (
+                                validate_team_grn_upload(
+                                    source_df,
+                                    current_grn,
+                                    column_map=mapping
+                                )
                             )
-                        )
 
-                    st.session_state["flex_grn_normalized"] = normalized_df
-                    st.session_state["flex_grn_validation"] = validation_df
-                    st.session_state["flex_grn_summary"] = validation_summary
-                    st.session_state["flex_grn_mapping"] = used_map
-                    st.session_state["flex_grn_file_name"] = team_grn_file.name
+                            # Keep only rows relevant to THIS uploaded workbook.
+                            # Retaining the entire reconciliation dataframe in
+                            # session_state can exhaust Streamlit Cloud memory.
+                            keep_cols = [
+                                c for c in (
+                                    ["Po Number","Invoice No","Product/Item No",
+                                     "Ledger Name","Item Description","Billed Qty"]
+                                    + GRN_TEAM_UPLOAD_FIELDS
+                                )
+                                if c in current_grn.columns
+                            ]
+                            snapshot = current_grn[keep_cols].copy()
 
-                    # Store only the columns needed to rebuild matching groups
-                    # on later Streamlit reruns. Do NOT re-run reconciliation.
-                    keep_cols = [
-                        c for c in (
-                            ["Po Number","Invoice No","Product/Item No",
-                             "Ledger Name","Item Description","Billed Qty"]
-                            + GRN_TEAM_UPLOAD_FIELDS
+                            if not normalized_df.empty and "_K" in normalized_df.columns:
+                                wanted_keys = set(
+                                    normalized_df["_K"].fillna("").astype(str).tolist()
+                                )
+                                snapshot_keys = _grn_key_series(snapshot)
+                                snapshot = snapshot.loc[
+                                    snapshot_keys.isin(wanted_keys)
+                                ].copy()
+
+                        st.session_state["flex_grn_normalized"] = normalized_df
+                        st.session_state["flex_grn_validation"] = validation_df
+                        st.session_state["flex_grn_summary"] = validation_summary
+                        st.session_state["flex_grn_mapping"] = used_map
+                        st.session_state["flex_grn_file_name"] = team_grn_file.name
+                        st.session_state["flex_grn_current_snapshot"] = snapshot
+
+                    except Exception as exc:
+                        # A bad row/type should show an actionable error rather than
+                        # terminating the complete Streamlit app.
+                        st.error(
+                            "GRN validation could not complete. "
+                            f"{type(exc).__name__}: {exc}"
                         )
-                        if c in current_grn.columns
-                    ]
-                    st.session_state["flex_grn_current_snapshot"] = (
-                        current_grn[keep_cols].copy()
-                    )
+                        for k in [
+                            "flex_grn_normalized","flex_grn_validation",
+                            "flex_grn_summary","flex_grn_mapping",
+                            "flex_grn_file_name","flex_grn_current_snapshot"
+                        ]:
+                            st.session_state.pop(k, None)
+                    finally:
+                        # The reconciliation result is large and is not required
+                        # after the small per-upload snapshot has been stored.
+                        current_grn = None
+                        try:
+                            available_main_dashboard.clear()
+                        except Exception:
+                            pass
+                        gc.collect()
 
             validation_df = st.session_state.get("flex_grn_validation")
             validation_summary = st.session_state.get("flex_grn_summary")
@@ -13026,13 +13051,7 @@ elif page == "GRN Bulk Upload":
                             0 if c in ("GRN Qty","Short Delivered") else ""
                         )
 
-                current_for_groups["_K"] = (
-                    current_for_groups["Po Number"].fillna("").astype(str).str.strip().str.upper()
-                    + "||"
-                    + current_for_groups["Invoice No"].fillna("").astype(str).str.strip().str.upper()
-                    + "||"
-                    + current_for_groups["Product/Item No"].fillna("").astype(str).str.strip().str.upper()
-                )
+                current_for_groups["_K"] = _grn_key_series(current_for_groups)
                 current_groups = {
                     k: g.copy()
                     for k, g in current_for_groups.groupby("_K", dropna=False)
@@ -13049,9 +13068,10 @@ elif page == "GRN Bulk Upload":
                 v5.metric("Not Found", f"{validation_summary['not_found']:,}")
 
                 if validation_summary["errors"]:
-                    st.error(
-                        "ERROR rows will never be updated. Correct the Excel or matching "
-                        "data and upload again."
+                    st.warning(
+                        "Some uploaded rows were skipped because validation failed. "
+                        "Open 'Errors Only' below and check the Issues column. "
+                        "Only READY/REVIEW rows can be updated; unmatched or invalid rows remain unchanged."
                     )
                 if validation_summary["review"]:
                     st.warning(
@@ -13089,7 +13109,7 @@ elif page == "GRN Bulk Upload":
                     show_df = show_df[show_df["Status"].eq("READY")]
 
                 st.dataframe(
-                    show_df,
+                    _arrow_safe_display_df(show_df),
                     width="stretch",
                     hide_index=True,
                     height=min(650, 90 + min(len(show_df), 16) * 34)
@@ -13174,7 +13194,7 @@ elif page == "GRN Bulk Upload":
                         expanded=False
                     ):
                         st.dataframe(
-                            prepared_updates,
+                            _arrow_safe_display_df(prepared_updates),
                             width="stretch",
                             hide_index=True,
                             height=min(
